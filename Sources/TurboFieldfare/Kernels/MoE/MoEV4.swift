@@ -29,8 +29,8 @@ public struct V4ExpertOffsets {
 /// Fused routed MoE for DeepSeek V4-Flash decode (V4F-02): FP4 e2m1 + ue8m0
 /// expert dequant, clamped SwiGLU phase 1, weighted top-6 reduce phase 2, and
 /// the BF16 sqrt-softplus router. Structural mirror of `MoE` with
-/// `maxStreamedExperts = 6`; every kernel lives in the self-compiled
-/// `moe_v4` module (see `V4ShaderLibrary`).
+/// `maxStreamedExperts = 6`; every kernel lives in the `moe_v4` module,
+/// compiled into the shared `MetalContext` library.
 final class MoEV4 {
     static let maxStreamedExperts = 6
 
@@ -46,15 +46,9 @@ final class MoEV4 {
 
     init(context: MetalContext) throws {
         self.device = context.device
-        let library = try V4ShaderLibrary().library(
-            device: context.device,
-            module: "moe_v4",
-            subdirectory: "Metal/MoE")
+        let library = context.library
         func pipeline(_ name: String) throws -> MTLComputePipelineState {
-            guard let function = library.makeFunction(name: name) else {
-                throw MetalError.missingFunction(name)
-            }
-            return try context.device.makeComputePipelineState(function: function)
+            try context.pipeline(name)
         }
         self.routerGemvPSO = try pipeline("router_v4_gemv_bf16")
         self.routerSelectPSO = try pipeline("router_v4_topk_select_k6")

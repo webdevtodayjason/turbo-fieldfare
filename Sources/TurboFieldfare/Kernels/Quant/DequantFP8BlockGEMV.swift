@@ -18,11 +18,7 @@ final class DequantFP8BlockGEMV {
     private let pipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
-        self.pipeline = try V4ShaderLibrary().pipeline(
-            device: context.device,
-            module: "dequant_v4",
-            subdirectory: "Metal/Quant",
-            name: "dequant_fp8_e4m3_gemv_simd")
+        self.pipeline = try context.pipeline("dequant_fp8_e4m3_gemv_simd")
     }
 
     func encode(commandBuffer: MTLCommandBuffer,

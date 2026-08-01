@@ -5,11 +5,11 @@ import Metal
 /// `attention_v4.metal` (V4F-03, milestones 2 and 3).
 ///
 /// Unlike `Attention` (Gemma, compiled into the shared `MetalContext`
-/// library), this class compiles `attention_v4.metal` standalone from the
-/// module bundle so no production file changes are required. Once V4
-/// integrates, `MetalContext.shaderModules` should gain "attention_v4" and
-/// this class can switch to `ctx.pipeline(...)` (noted as a shared change
-/// in the V4F-03 report).
+/// library), this class historically compiled `attention_v4.metal`
+/// standalone. The module is now registered in `MetalContext.shaderModules`
+/// (V4F-04), so pipelines come from the shared context via
+/// `V4ShaderLibrary.context(for:)`; the `init(device:...)` signature stays
+/// for the committed call sites.
 ///
 /// Decode entry points:
 ///
@@ -44,7 +44,7 @@ final class V4Attention {
     static let softmaxScale: Float = 1.0 / Float(512).squareRoot()
 
     private let device: MTLDevice
-    private let library: MTLLibrary
+    private let context: MetalContext
 
     // Partial scratch (pass 1 -> pass 2, hazard-tracked in one CB).
     private let mPartial: MTLBuffer
@@ -64,22 +64,10 @@ final class V4Attention {
     private let gatherList: MTLBuffer
     private let maxGather: Int
 
-    init(device: MTLDevice, maxContext: Int, bundle: Bundle = .module) throws {
+    init(device: MTLDevice, maxContext: Int, bundle _: Bundle = .module) throws {
         precondition(maxContext > 0)
         self.device = device
-        guard let url = bundle.url(forResource: "attention_v4",
-                                   withExtension: "metal",
-                                   subdirectory: "Metal/Attention") else {
-            throw MetalError.missingShaderResource("attention_v4")
-        }
-        let source = try String(contentsOf: url, encoding: .utf8)
-        let opts = MTLCompileOptions()
-        opts.languageVersion = .version4_0
-        do {
-            self.library = try device.makeLibrary(source: source, options: opts)
-        } catch {
-            throw MetalError.libraryCompileFailed("\(error)")
-        }
+        self.context = try V4ShaderLibrary.context(for: device)
 
         let md = Self.numQHeads * Self.maxChunks
         guard let m = device.makeBuffer(length: md * MemoryLayout<Float>.size,
@@ -124,10 +112,7 @@ final class V4Attention {
     }
 
     private func pipeline(_ name: String) throws -> MTLComputePipelineState {
-        guard let fn = library.makeFunction(name: name) else {
-            throw MetalError.missingFunction(name)
-        }
-        return try device.makeComputePipelineState(function: fn)
+        try context.pipeline(name)
     }
 
     // MARK: - Milestone 2: ratio-0 sliding-window MQA
@@ -271,7 +256,8 @@ final class V4Attention {
     func encodeCSACompressGroup(commandBuffer cb: MTLCommandBuffer,
                                 prevKV: MTLBuffer, curKV: MTLBuffer,
                                 prevGate: MTLBuffer, curGate: MTLBuffer,
-                                ape: MTLBuffer, gamma: MTLBuffer,
+                                ape: MTLBuffer, apeOffset: Int = 0,
+                                gamma: MTLBuffer, gammaOffset: Int = 0,
                                 outValues: MTLBuffer, valuesOffset: Int,
                                 outScales: MTLBuffer, scalesOffset: Int,
                                 outRope: MTLBuffer, ropeOffset: Int,
@@ -291,8 +277,8 @@ final class V4Attention {
             enc.setBuffer(curKV, offset: 0, index: 1)
             enc.setBuffer(prevGate, offset: 0, index: 2)
             enc.setBuffer(curGate, offset: 0, index: 3)
-            enc.setBuffer(ape, offset: 0, index: 4)
-            enc.setBuffer(gamma, offset: 0, index: 5)
+            enc.setBuffer(ape, offset: apeOffset, index: 4)
+            enc.setBuffer(gamma, offset: gammaOffset, index: 5)
             enc.setBuffer(outValues, offset: valuesOffset, index: 6)
             enc.setBuffer(outScales, offset: scalesOffset, index: 7)
             enc.setBuffer(outRope, offset: ropeOffset, index: 8)

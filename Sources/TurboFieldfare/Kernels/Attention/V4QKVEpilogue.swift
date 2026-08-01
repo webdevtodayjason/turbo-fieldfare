@@ -46,6 +46,21 @@ final class V4QKVEpilogue {
         var compressorOutDim: Int = 0
         /// Indexer up-projection FP8 [64*128, 1024]; nil on non-CSA layers.
         var indexerWqB: (codes: MTLBuffer, scales: MTLBuffer)?
+        /// Byte offsets for resident-file buffer views (the V4F-04 runner
+        /// passes views into the shared resident buffer; unit tests pass
+        /// dedicated buffers and leave these zero).
+        var wqACodesOffset: Int = 0
+        var wqAScalesOffset: Int = 0
+        var wqBCodesOffset: Int = 0
+        var wqBScalesOffset: Int = 0
+        var qNormGammaOffset: Int = 0
+        var windowWKVCodesOffset: Int = 0
+        var windowWKVScalesOffset: Int = 0
+        var kvNormGammaOffset: Int = 0
+        var compressorWKVOffset: Int = 0
+        var compressorWGateOffset: Int = 0
+        var indexerWqBCodesOffset: Int = 0
+        var indexerWqBScalesOffset: Int = 0
     }
 
     /// Where the token's window KV lands (from
@@ -120,15 +135,18 @@ final class V4QKVEpilogue {
         precondition(xOffset % 8 == 0, "FP8 GEMV x reads need 8-aligned xOffset")
         // Q: wq_a -> qr scratch, RMSNorm in place, wq_b -> qOut, renorm, RoPE.
         encodeFP8GEMV(commandBuffer: cb,
-                      codes: weights.wqA.codes, scales: weights.wqA.scales,
+                      codes: weights.wqA.codes, codesOffset: weights.wqACodesOffset,
+                      scales: weights.wqA.scales, scalesOffset: weights.wqAScalesOffset,
                       x: x, xOffset: xOffset,
                       y: qr, yOffset: 0,
                       m: Self.qLoraRank, n: Self.dim)
         encodeRMSNorm(commandBuffer: cb,
                       buf: qr, gamma: weights.qNormGamma,
+                      gammaOffset: weights.qNormGammaOffset,
                       n: Self.qLoraRank, eps: normEps, useGamma: true)
         encodeFP8GEMV(commandBuffer: cb,
-                      codes: weights.wqB.codes, scales: weights.wqB.scales,
+                      codes: weights.wqB.codes, codesOffset: weights.wqBCodesOffset,
+                      scales: weights.wqB.scales, scalesOffset: weights.wqBScalesOffset,
                       x: qr, xOffset: 0,
                       y: qOut, yOffset: qOutOffset,
                       m: Self.numQHeads * Self.headDim, n: Self.qLoraRank)
@@ -144,13 +162,16 @@ final class V4QKVEpilogue {
         if let slot = windowSlot {
             encodeFP8GEMV(commandBuffer: cb,
                           codes: weights.windowWKV.codes,
+                          codesOffset: weights.windowWKVCodesOffset,
                           scales: weights.windowWKV.scales,
+                          scalesOffset: weights.windowWKVScalesOffset,
                           x: x, xOffset: xOffset,
                           y: slot.buffer, yOffset: slot.offset,
                           m: Self.headDim, n: Self.dim)
             encodeRMSNorm(commandBuffer: cb,
                           buf: slot.buffer, bufOffset: slot.offset,
                           gamma: weights.kvNormGamma,
+                          gammaOffset: weights.kvNormGammaOffset,
                           n: Self.headDim, eps: normEps, useGamma: true)
             encodeRoPE(commandBuffer: cb,
                        buf: slot.buffer, bufOffset: slot.offset,
@@ -164,11 +185,13 @@ final class V4QKVEpilogue {
                          compressorWKVOut != nil && compressorWGateOut != nil,
                          "compressor weights require outputs and an out-dim")
             encodeF32GEMV(commandBuffer: cb,
-                          w: wkv, x: x, xOffset: xOffset,
+                          w: wkv, wOffset: weights.compressorWKVOffset,
+                          x: x, xOffset: xOffset,
                           y: compressorWKVOut!,
                           m: weights.compressorOutDim, n: Self.dim)
             encodeF32GEMV(commandBuffer: cb,
-                          w: wgate, x: x, xOffset: xOffset,
+                          w: wgate, wOffset: weights.compressorWGateOffset,
+                          x: x, xOffset: xOffset,
                           y: compressorWGateOut!,
                           m: weights.compressorOutDim, n: Self.dim)
         }
@@ -176,7 +199,10 @@ final class V4QKVEpilogue {
         // Indexer queries from the shared qr (no weight-free renorm).
         if let indexWqB = weights.indexerWqB, let indexQOut {
             encodeFP8GEMV(commandBuffer: cb,
-                          codes: indexWqB.codes, scales: indexWqB.scales,
+                          codes: indexWqB.codes,
+                          codesOffset: weights.indexerWqBCodesOffset,
+                          scales: indexWqB.scales,
+                          scalesOffset: weights.indexerWqBScalesOffset,
                           x: qr, xOffset: 0,
                           y: indexQOut, yOffset: 0,
                           m: Self.numQHeads * Self.indexHeadDim,
@@ -191,14 +217,16 @@ final class V4QKVEpilogue {
     // MARK: - Stage encoders
 
     private func encodeFP8GEMV(commandBuffer cb: MTLCommandBuffer,
-                               codes: MTLBuffer, scales: MTLBuffer,
+                               codes: MTLBuffer, codesOffset: Int = 0,
+                               scales: MTLBuffer, scalesOffset: Int = 0,
                                x: MTLBuffer, xOffset: Int,
                                y: MTLBuffer, yOffset: Int,
                                m: Int, n: Int) {
+        precondition(codesOffset % 4 == 0, "FP8 GEMV needs 4-aligned codes")
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(fp8PSO)
-        enc.setBuffer(codes, offset: 0, index: 0)
-        enc.setBuffer(scales, offset: 0, index: 1)
+        enc.setBuffer(codes, offset: codesOffset, index: 0)
+        enc.setBuffer(scales, offset: scalesOffset, index: 1)
         enc.setBuffer(x, offset: xOffset, index: 2)
         enc.setBuffer(y, offset: yOffset, index: 3)
         var mv = UInt32(m)
@@ -213,12 +241,12 @@ final class V4QKVEpilogue {
     /// In-place RMSNorm (`buf` read and written).
     private func encodeRMSNorm(commandBuffer cb: MTLCommandBuffer,
                                buf: MTLBuffer, bufOffset: Int = 0,
-                               gamma: MTLBuffer,
+                               gamma: MTLBuffer, gammaOffset: Int = 0,
                                n: Int, eps: Float, useGamma: Bool) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(rmsnormPSO)
         enc.setBuffer(buf, offset: bufOffset, index: 0)
-        enc.setBuffer(gamma, offset: 0, index: 1)
+        enc.setBuffer(gamma, offset: gammaOffset, index: 1)
         enc.setBuffer(buf, offset: bufOffset, index: 2)
         var nv = UInt32(n)
         var e = eps
@@ -284,13 +312,14 @@ final class V4QKVEpilogue {
     }
 
     private func encodeF32GEMV(commandBuffer cb: MTLCommandBuffer,
-                               w: MTLBuffer,
+                               w: MTLBuffer, wOffset: Int = 0,
                                x: MTLBuffer, xOffset: Int,
                                y: MTLBuffer,
                                m: Int, n: Int) {
+        precondition(wOffset % 16 == 0, "v4b_gemv_f32 needs a 16-aligned weights base")
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(gemvF32PSO)
-        enc.setBuffer(w, offset: 0, index: 0)
+        enc.setBuffer(w, offset: wOffset, index: 0)
         enc.setBuffer(x, offset: xOffset, index: 1)
         enc.setBuffer(y, offset: 0, index: 2)
         var mv = UInt32(m)

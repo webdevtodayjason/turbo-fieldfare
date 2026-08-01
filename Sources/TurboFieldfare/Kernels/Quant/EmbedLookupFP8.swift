@@ -7,11 +7,7 @@ final class EmbedLookupFP8 {
     private let pipeline: MTLComputePipelineState
 
     init(context: MetalContext) throws {
-        self.pipeline = try V4ShaderLibrary().pipeline(
-            device: context.device,
-            module: "dequant_v4",
-            subdirectory: "Metal/Quant",
-            name: "embed_lookup_fp8")
+        self.pipeline = try context.pipeline("embed_lookup_fp8")
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
