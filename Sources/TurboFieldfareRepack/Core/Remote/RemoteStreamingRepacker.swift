@@ -250,6 +250,7 @@ public final class RemoteStreamingRepacker {
         audit.sourceSnapshotSha256 = snapshot.metadata.indexSha256Hex
         audit.bitWidthOverridesHonored = snapshot.metadata.bitsOverrides.count
         audit.tensorsDroppedMultimodal = plan.excludedMultimodalTensorNames
+        audit.tensorsDroppedMTP = plan.droppedMTPTensorNames
         audit.packedExpertLayoutMode = "identity"
 
         if options.dryRunSpaceCheck {

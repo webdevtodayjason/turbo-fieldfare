@@ -37,10 +37,14 @@ enum Safetensors {
             }
             let dtype: SourceTensor.Dtype
             switch dtypeStr {
-            case "U32":  dtype = .u32
-            case "BF16": dtype = .bf16
-            case "F16":  dtype = .fp16
-            case "F32":  dtype = .fp32
+            case "U32":     dtype = .u32
+            case "BF16":    dtype = .bf16
+            case "F16":     dtype = .fp16
+            case "F32":     dtype = .fp32
+            case "I8":      dtype = .i8
+            case "I64":     dtype = .i64
+            case "F8_E4M3": dtype = .f8e4m3
+            case "F8_E8M0": dtype = .f8e8m0
             default: throw RepackError.safetensorsUnknownDtype(path: path, dtype: dtypeStr)
             }
             guard let shape = entry["shape"] as? [Any] else {
