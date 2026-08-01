@@ -188,6 +188,24 @@ Work orders delivered: [V4F-01 repack](recon/V4F-01-repack-workorder.md),
 | V4F-03 attention | ~28 days | Compressed KV manager, CSA indexer, sparse prefill (schedule risk) |
 | **Total serial** | **~53-59 engineer-days** | Plus V4F-04 integration and V4F-05 validation |
 
+Implementation status (branch `v4f`, 2026-08-01):
+
+- **V4F-01 landed** (`2e47147`): dual config-family parsing, dtype
+  extension, per-expert planner fork (page-aligned 13,369,344-byte
+  6-slice blobs), family-versioned manifest (Gemma byte-identical), MTP
+  dropped and audited. 5/5 round-trip + 39/39 pre-existing repack tests.
+- **V4F-02 decode kernels landed** (`06b84f5`): FP4 e2m1+ue8m0 GEMV, FP8
+  e4m3 block GEMV, FP8 embed lookup, BF16 sqrtsoftplus router (static
+  bias, k=6), fused clamped-SwiGLU MoE. 22/22 GPU fixture checks.
+- **V4F-03 foundations landed** (`2aadeec`): CompressedKVCacheManager,
+  merged sparse+window MQA decode, CSA compressor, lightning indexer.
+  **Indexer recall gate: exact** at 600/3000/20000 blocks; CSA decode
+  chain matches CPU reference. 49/49 V4 tests pass.
+- Follow-up queue for wave 2: MetalContext registration of the new
+  shader modules, RoPE variants, mHC boundary kernels, grouped
+  o-projection, Q/KV LoRA epilogue, HCA compressor kernel, prefill
+  paths, tokenizer/DSML chat format, then V4F-04 runtime wiring.
+
 De-risking findings:
 
 - **cb1/cb2 survives.** CSA top-512 selection touches only GPU-resident
