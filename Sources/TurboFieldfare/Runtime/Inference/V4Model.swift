@@ -20,6 +20,7 @@ public struct V4Model {
     public let config: V4ArchConfig
     public let streamingMode: ExpertStreamingMode
     public let expertCachePolicy: ExpertCachePolicy
+    public let integrityPolicy: ModelIntegrityPolicy
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
 
@@ -46,6 +47,7 @@ public struct V4Model {
          config: V4ArchConfig,
          streamingMode: ExpertStreamingMode,
          expertCachePolicy: ExpertCachePolicy,
+         integrityPolicy: ModelIntegrityPolicy,
          residentBuffer: ResidentBuffer,
          residentIndex: ResidentIndex,
          packedExpertsLayout: PackedExpertsLayout,
@@ -55,6 +57,7 @@ public struct V4Model {
         self.config = config
         self.streamingMode = streamingMode
         self.expertCachePolicy = expertCachePolicy
+        self.integrityPolicy = integrityPolicy
         self.residentBuffer = residentBuffer
         self.residentIndex = residentIndex
         self.packedExpertsLayout = packedExpertsLayout
@@ -350,11 +353,15 @@ public struct V4Model {
             guard let entry = manifest.files[manifestRel] else {
                 throw ModelError.missingFile(name: manifestRel)
             }
-            // V1: full SHA-256 verification only. Trusted install receipts
-            // for the V4 family are a noted follow-up (the receipt format
-            // binds to the Gemma Manifest type).
-            try Sha256Verifier.verifyFile(at: url, named: manifestRel,
-                                          expectedHex: entry.sha256)
+            switch integrityPolicy {
+            case .fullSha256:
+                try Sha256Verifier.verifyFile(at: url, named: manifestRel,
+                                              expectedHex: entry.sha256)
+            case .sizeCheckTrustedReceipt:
+                try Self.verifyTrustedReceiptFileSize(url: url,
+                                                      relativePath: manifestRel,
+                                                      expectedSize: entry.size)
+            }
             streamersBox.layerVerified[L] = true
         }
         let streamSize = UInt64(packedExpertsLayout.expertsPerLayer)
@@ -394,12 +401,14 @@ extension V4Model {
                             expecting: V4ArchConfig,
                             streamingMode: ExpertStreamingMode = .pread(slotCount: 16),
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
+                            integrityPolicy: ModelIntegrityPolicy? = nil,
                             loadStats: UnsafeMutablePointer<ModelLoadStats>? = nil) throws -> V4Model {
         var stats = ModelLoadStats()
         defer {
             loadStats?.pointee = stats
         }
 
+        let resolvedIntegrityPolicy = integrityPolicy ?? .fullSha256
         let manifestURL = directoryURL.appendingPathComponent("manifest.json")
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
             throw ModelError.partialInstall(path: directoryURL.path)
@@ -410,11 +419,35 @@ extension V4Model {
         }
 
         let manifestShaStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        _ = try Sha256Verifier.hashFile(at: manifestURL)
+        let manifestSha = try Sha256Verifier.hashFile(at: manifestURL)
         stats.manifestSha256Nanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - manifestShaStart
+        let manifestSize = try Self.fileSize(at: manifestURL,
+                                             relativePath: "manifest.json")
+        let receipt: VerifiedInstallReceipt?
+        if resolvedIntegrityPolicy == .sizeCheckTrustedReceipt {
+            let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            let loadedReceipt = try VerifiedInstallReceiptReader.load(directoryURL: directoryURL)
+            try VerifiedInstallReceiptReader.validateManifestBinding(
+                loadedReceipt,
+                directoryURL: directoryURL,
+                manifestSha256: manifestSha)
+            stats.receiptValidationNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - receiptStart
+            receipt = loadedReceipt
+        } else {
+            receipt = nil
+        }
 
         let manifest = try ManifestReader.loadV4(directoryURL: directoryURL,
                                                  expecting: expecting)
+        if let receipt {
+            let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            try VerifiedInstallReceiptReader.validate(receipt,
+                                                      directoryURL: directoryURL,
+                                                      manifest: manifest,
+                                                      manifestSha256: manifestSha,
+                                                      manifestSize: manifestSize)
+            stats.receiptValidationNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - receiptStart
+        }
 
         let weightsURL = directoryURL.appendingPathComponent("model_weights.bin")
         let layoutURL  = directoryURL
@@ -455,16 +488,100 @@ extension V4Model {
             device: device)
 
         let layout = try PackedExpertsLayoutReader.load(directoryURL: directoryURL)
+        if resolvedIntegrityPolicy == .sizeCheckTrustedReceipt {
+            let receiptStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            try validateTrustedReceiptLayerLayout(directoryURL: directoryURL,
+                                                  manifest: manifest,
+                                                  layout: layout)
+            stats.receiptValidationNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - receiptStart
+        }
 
         return V4Model(
             device: device,
             config: expecting,
             streamingMode: streamingMode,
             expertCachePolicy: expertCachePolicy,
+            integrityPolicy: resolvedIntegrityPolicy,
             residentBuffer: residentBuffer,
             residentIndex: residentIndex,
             packedExpertsLayout: layout,
             manifest: manifest,
             directoryURL: directoryURL)
+    }
+
+    private static func verifyTrustedReceiptFileSize(url: URL,
+                                                     relativePath: String,
+                                                     expectedSize: UInt64) throws {
+        let actualSize = try fileSize(at: url, relativePath: relativePath)
+        guard actualSize == expectedSize else {
+            throw ModelError.trustedReceiptInvalid(
+                detail: "\(relativePath) size \(actualSize) != \(expectedSize)")
+        }
+    }
+
+    private static func fileSize(at url: URL, relativePath: String) throws -> UInt64 {
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let sizeValue = attrs[.size] else {
+            throw ModelError.trustedReceiptInvalid(detail: "missing size for \(relativePath)")
+        }
+        if let number = sizeValue as? NSNumber { return number.uint64Value }
+        if let value = sizeValue as? UInt64 { return value }
+        if let value = sizeValue as? Int { return UInt64(value) }
+        throw ModelError.trustedReceiptInvalid(detail: "invalid size for \(relativePath)")
+    }
+
+    private static func validateTrustedReceiptLayerLayout(directoryURL: URL,
+                                                          manifest: V4Manifest,
+                                                          layout: PackedExpertsLayout) throws {
+        let pageSize = UInt64(getpagesize())
+        guard layout.expertStride % pageSize == 0 else {
+            throw ModelError.trustedReceiptInvalid(
+                detail: "expertStride \(layout.expertStride) is not page-aligned")
+        }
+        guard layout.numLayers == manifest.numLayers,
+              layout.expertsPerLayer == manifest.expertsPerLayer,
+              layout.expertStride == manifest.expertStride else {
+            throw ModelError.trustedReceiptInvalid(detail: "layout does not match manifest dimensions")
+        }
+        for layer in layout.layers {
+            guard layer.layer >= 0 && layer.layer < manifest.numLayers else {
+                throw ModelError.trustedReceiptInvalid(detail: "layout layer out of range")
+            }
+            let relativePath = "packed_experts/\(layer.file)"
+            guard let manifestEntry = manifest.files[relativePath] else {
+                throw ModelError.trustedReceiptInvalid(detail: "manifest missing \(relativePath)")
+            }
+            let expectedSize = UInt64(layout.expertsPerLayer) * layout.expertStride
+            guard manifestEntry.size == expectedSize else {
+                throw ModelError.trustedReceiptInvalid(
+                    detail: "\(relativePath) manifest size \(manifestEntry.size) != \(expectedSize)")
+            }
+            let url = directoryURL
+                .appendingPathComponent("packed_experts")
+                .appendingPathComponent(layer.file)
+            let actualSize = try fileSize(at: url, relativePath: relativePath)
+            guard actualSize == expectedSize else {
+                throw ModelError.trustedReceiptInvalid(
+                    detail: "\(relativePath) size \(actualSize) != \(expectedSize)")
+            }
+            guard layer.experts.count == layout.expertsPerLayer else {
+                throw ModelError.trustedReceiptInvalid(detail: "\(relativePath) expert count mismatch")
+            }
+            for expert in layer.experts {
+                guard expert.size == layout.expertStride else {
+                    throw ModelError.trustedReceiptInvalid(
+                        detail: "\(relativePath) expert \(expert.expert) size mismatch")
+                }
+                guard expert.offset % pageSize == 0 else {
+                    throw ModelError.trustedReceiptInvalid(
+                        detail: "\(relativePath) expert \(expert.expert) offset is not page-aligned")
+                }
+                guard expert.offset <= actualSize,
+                      expert.size <= actualSize - expert.offset else {
+                    throw ModelError.trustedReceiptInvalid(
+                        detail: "\(relativePath) expert \(expert.expert) range exceeds file size")
+                }
+            }
+        }
     }
 }

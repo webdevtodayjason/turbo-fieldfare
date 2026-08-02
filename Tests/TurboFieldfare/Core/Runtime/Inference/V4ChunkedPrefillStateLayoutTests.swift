@@ -43,4 +43,14 @@ import Testing
         #expect(layout.routerLogitsBytes != 128 * 256 * 2)
         #expect(layout.routeWeightsBytes != 128 * 6 * 2)
     }
+
+    @Test func v4LayoutSupportsAChunkLargerThanItsSlidingWindow() {
+        let layout = V4ChunkedPrefillState.Layout(rows: 256,
+                                                  dim: 4096,
+                                                  ffn: 2048,
+                                                  experts: 256,
+                                                  layers: 43)
+        #expect(layout.rows == 256)
+        #expect(layout.qBytes == 256 * 64 * 512 * MemoryLayout<Float16>.stride)
+    }
 }

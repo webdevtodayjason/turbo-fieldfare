@@ -24,7 +24,7 @@ internal final class V4ChunkedPrefillState {
         internal static let topK = 6
 
         internal init(rows: Int, dim: Int, ffn: Int, experts: Int, layers: Int) {
-            precondition(rows > 0 && rows <= 128)
+            precondition(rows > 0 && rows <= PrefillRuntimeConfig.absoluteMaxChunkTokens)
             self.rows = rows
             self.dim = dim
             self.ffn = ffn
@@ -105,7 +105,7 @@ internal final class V4ChunkedPrefillState {
                   attention: V4Attention,
                   compressorAccumulators: V4CompressorAccumulatorStore,
                   maxRows: Int = 128) throws {
-        precondition(maxRows > 0 && maxRows <= 128)
+        precondition(maxRows > 0 && maxRows <= PrefillRuntimeConfig.absoluteMaxChunkTokens)
         self.model = model
         self.cache = cache
         self.attention = attention

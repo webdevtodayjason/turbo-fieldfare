@@ -82,10 +82,34 @@ public enum VerifiedInstallReceiptReader {
                                 manifest: Manifest,
                                 manifestSha256: String,
                                 manifestSize: UInt64) throws {
+        try validate(receipt,
+                     directoryURL: directoryURL,
+                     manifestFiles: manifest.files,
+                     manifestSha256: manifestSha256,
+                     manifestSize: manifestSize)
+    }
+
+    public static func validate(_ receipt: VerifiedInstallReceipt,
+                                directoryURL: URL,
+                                manifest: V4Manifest,
+                                manifestSha256: String,
+                                manifestSize: UInt64) throws {
+        try validate(receipt,
+                     directoryURL: directoryURL,
+                     manifestFiles: manifest.files,
+                     manifestSha256: manifestSha256,
+                     manifestSize: manifestSize)
+    }
+
+    private static func validate(_ receipt: VerifiedInstallReceipt,
+                                 directoryURL: URL,
+                                 manifestFiles: [String: ManifestFileEntry],
+                                 manifestSha256: String,
+                                 manifestSize: UInt64) throws {
         try validateManifestBinding(receipt,
                                     directoryURL: directoryURL,
                                     manifestSha256: manifestSha256)
-        var expectedFiles = Set(manifest.files.keys)
+        var expectedFiles = Set(manifestFiles.keys)
         expectedFiles.insert("manifest.json")
         let receiptFiles = Set(receipt.files.keys)
         guard receiptFiles == expectedFiles else {
@@ -104,7 +128,7 @@ public enum VerifiedInstallReceiptReader {
             throw ModelError.trustedReceiptInvalid(detail: "manifest.json SHA mismatch")
         }
 
-        for (rel, manifestEntry) in manifest.files {
+        for (rel, manifestEntry) in manifestFiles {
             guard let receiptEntry = receipt.files[rel] else {
                 throw ModelError.trustedReceiptInvalid(detail: "receipt missing \(rel)")
             }

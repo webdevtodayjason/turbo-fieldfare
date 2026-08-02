@@ -63,7 +63,7 @@ enum V4ChunkedPrefillEnvError: Error, CustomStringConvertible, Equatable {
     var description: String {
         switch self {
         case .invalidChunkTokens(let value):
-            return "TURBO_V4_PREFILL_CHUNK_TOKENS must be one of 32, 64, or 128 when TURBO_V4_CHUNKED_PREFILL=1; got \"\(value)\""
+            return "TURBO_V4_PREFILL_CHUNK_TOKENS must be one of 32, 64, 128, or 256 when TURBO_V4_CHUNKED_PREFILL=1; got \"\(value)\""
         }
     }
 }
@@ -71,10 +71,14 @@ enum V4ChunkedPrefillEnvError: Error, CustomStringConvertible, Equatable {
 func v4ChunkedPrefillConfigFromEnv(_ env: [String: String] = ProcessInfo.processInfo.environment) throws -> PrefillRuntimeConfig {
     guard env["TURBO_V4_CHUNKED_PREFILL"] == "1" else { return .off }
     let rawChunkTokens = env["TURBO_V4_PREFILL_CHUNK_TOKENS"] ?? "128"
-    guard let chunkTokens = Int(rawChunkTokens), [32, 64, 128].contains(chunkTokens) else {
+    guard let chunkTokens = Int(rawChunkTokens), [32, 64, 128, 256].contains(chunkTokens) else {
         throw V4ChunkedPrefillEnvError.invalidChunkTokens(rawChunkTokens)
     }
-    return .production(chunkTokens: chunkTokens)
+    return .v4Production(chunkTokens: chunkTokens)
+}
+
+func v4IntegrityPolicyFromEnv(_ env: [String: String] = ProcessInfo.processInfo.environment) -> ModelIntegrityPolicy {
+    env["TURBO_V4_TRUSTED_INSTALL"] == "1" ? .sizeCheckTrustedReceipt : .fullSha256
 }
 
 /// V4-family entry point. Raw `--prompt` completion only for now; the DSML
@@ -96,7 +100,8 @@ func runV4(args: Args,
             device: context.device,
             expecting: .deepSeekV4Flash,
             streamingMode: .pread(slotCount: RuntimeConfiguration().expertCacheSlots),
-            expertCachePolicy: .lfu)
+            expertCachePolicy: .lfu,
+            integrityPolicy: v4IntegrityPolicyFromEnv())
         let prefillConfig = try v4ChunkedPrefillConfigFromEnv()
         let producer = try V4LogitProducer(model: model, maxContext: args.maxContext)
         let scratch = try RawCompletionScratch(context: context,
