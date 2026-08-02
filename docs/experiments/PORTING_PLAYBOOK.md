@@ -321,6 +321,18 @@ byte-identically, so they are greedy model behavior, not corruption.
 The ladder's exact-answer criterion is a tripwire, not a quality
 metric; sampled-protocol output (0.2/64/0.95) verified coherent and
 non-looping separately.
+
+Process note (2026-08-02): worker reliability. Four workers died
+mid-task across the port (penguin, sheep, sloth, badger), all in long
+reading phases, all from Kimi K3 API stream timeouts — infrastructure,
+not task failure. The recovery pattern that worked every time:
+archive partial state (tar + patch into scratch), then either salvage
+with a fresh worker carrying an arbitration rule (tested code wins
+every overlap) or split the brief narrower. Briefs that survived were
+single-file or synthetic-gated with minimal required reading; briefs
+that died asked one worker to hold ~3000 lines of API surface in
+context. Coordinator-written code was the fallback for the one task
+(the decode runner) that failed three times in a row.
 - **Drift RESOLVED (2026-08-02, diagnosis worker):** two runner
   composition bugs, both in `V4ForwardRunner.forward`, both
   per-token uniform (kernels and cache manager exonerated):
