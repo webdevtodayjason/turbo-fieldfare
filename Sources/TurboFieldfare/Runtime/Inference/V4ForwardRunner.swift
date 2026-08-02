@@ -1,0 +1,618 @@
+import Foundation
+import Metal
+
+/// Decode forward runner for DeepSeek V4-Flash (V4F-04). Composes the
+/// committed V4 kernel wrappers into the per-token layer graph:
+///
+///   embed broadcast -> per layer [ mHC attn boundary -> QKV epilogue ->
+///   group flush (CSA/HCA) -> attention (window / CSA / HCA) -> output
+///   de-rotation -> grouped o-proj -> mHC post -> mHC ffn boundary ->
+///   router (or hash table) -> expert stream -> fused SwiGLU MoE + shared
+///   expert -> mHC post ] -> head boundary -> final norm -> fp32 lm_head.
+///
+/// Command-buffer phasing mirrors the Gemma cb1/io/cb2 pattern:
+///
+/// - `cb1` ends at the router's top-6 readback (router layers) or
+///   immediately (hash layers read the resident tid2eid table on CPU).
+/// - `cb2` encodes the resident shared expert and the cache-HIT subset of
+///   routed phase 1 while the async `pread` fills miss slots.
+/// - `cb3` runs the miss-subset phase 1, the weighted phase-2 reduce
+///   (shared-expert output as the residual add), and the mHC ffn post.
+///
+/// Recorded v1 simplifications (follow-ups, not oversights):
+///
+/// - Layers are serialized: cb3 completes before the next layer's plan,
+///   so a later layer's cache plan can never evict a slot that queued GPU
+///   work still owns. Cross-layer pipelining with `avoidingSlots` is the
+///   V4F-04 follow-up that recovers the Gemma pipeline depth.
+/// - Decode only. Prefill is the V4F-06 work item.
+/// - The compressor epilogue writes one fp32 row at offset 0 of a scratch
+///   buffer per token; the runner blits rows into the group accumulators
+///   (CSA: prev/cur 4-row buffers, 1024-dim; HCA: 128 rows, 512-dim). A
+///   row-offset variant of `V4QKVEpilogue.encodeDecode` would remove the
+///   blit.
+final class V4ForwardRunner {
+
+    // MARK: - Dependencies
+
+    private let model: V4Model
+    private let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private let cache: CompressedKVCacheManager
+    private let attention: V4Attention
+    private let qkv: V4QKVEpilogue
+    private let rope: V4RoPE
+    private let hc: V4HyperConnections
+    private let outProj: V4OutputProjection
+    private let hca: V4HCACompressor
+    private let moe: MoEV4
+    private let glue: V4DecodeGlue
+    private let fp8: DequantFP8BlockGEMV
+
+    private var dim: Int { model.config.hiddenSize }
+    private var ffn: Int { model.config.moeIntermediateSize }
+    private var streams: Int { model.config.hcMult }
+    private var topK: Int { model.config.topKExperts }
+    private var numExperts: Int { model.config.numExperts }
+    private var eps: Float { Float(model.config.rmsNormEps) }
+    private var swigluLimit: Float { Float(model.config.swigluLimit) }
+    private var routeScale: Float { Float(model.config.routedScalingFactor) }
+
+    // MARK: - Scratch (allocated once, reused across tokens and layers)
+
+    private let stream: MTLBuffer        // [4 * dim] fp32 mHC residual stream
+    private let branch: MTLBuffer        // [dim] fp32 mHC pre-gather output
+    private let xNorm: MTLBuffer         // [dim] fp16 normed branch input
+    private let q: MTLBuffer             // [64, 512] fp16 queries
+    private let indexQ: MTLBuffer        // [64, 128] fp16 indexer queries
+    private let indexW: MTLBuffer        // [64] fp32 indexer head weights
+    private let attnOut: MTLBuffer       // [64, 512] fp16 attention output
+    private let oProjOut: MTLBuffer      // [dim] fp16 attention projection
+    private let routerIdx: MTLBuffer     // [6] int32 (CPU readback)
+    private let routerWts: MTLBuffer     // [6] fp32
+    private let routerLogits: MTLBuffer  // [numExperts] fp32 (hash scores)
+    private let acts: MTLBuffer          // [6 * F] fp16 routed activations
+    private let sharedGate: MTLBuffer    // [F] fp16
+    private let sharedUp: MTLBuffer      // [F] fp16
+    private let sharedAct: MTLBuffer     // [F] fp16
+    private let sharedOut: MTLBuffer     // [dim] fp16 shared-expert output
+    private let ffnOut: MTLBuffer        // [dim] fp16 shared + routed
+    private let slotUpload: MTLBuffer    // [6] uint32 active-slot list
+    private let idUpload: MTLBuffer      // [6] int32 hash-layer expert ids
+    private let logits: MTLBuffer        // [vocab] fp32
+    // Compressor group accumulators (fp32; kernels read from offset 0).
+    private let csaPrevKV: MTLBuffer     // [4, 1024] fp32
+    private let csaCurKV: MTLBuffer      // [4, 1024] fp32
+    private let csaPrevGate: MTLBuffer   // [4, 1024] fp32
+    private let csaCurGate: MTLBuffer    // [4, 1024] fp32
+    private let idxPrevKV: MTLBuffer     // [4, 128] fp32 (indexer series)
+    private let idxCurKV: MTLBuffer      // [4, 128] fp32
+    private let idxPrevGate: MTLBuffer   // [4, 128] fp32
+    private let idxCurGate: MTLBuffer    // [4, 128] fp32
+    private let hcaRingKV: MTLBuffer     // [128, 512] fp32
+    private let hcaRingGate: MTLBuffer   // [128, 512] fp32
+    private let rowScratch: MTLBuffer    // [1024] fp32 epilogue single row
+    private let rowScratch2: MTLBuffer   // [1024] fp32 second series
+
+    init(model: V4Model, maxContext: Int) throws {
+        self.model = model
+        self.device = model.device
+        let context = try V4ShaderLibrary.context(for: model.device)
+        self.queue = context.queue
+        let cacheConfig = V4CacheConfig(compressRatios: model.config.compressRatios,
+                                        headDim: model.config.headDim,
+                                        ropeDim: model.config.qkRopeHeadDim,
+                                        window: model.config.slidingWindow,
+                                        numQHeads: model.config.numHeads)
+        self.cache = try CompressedKVCacheManager(device: model.device,
+                                                  config: cacheConfig,
+                                                  maxContext: maxContext)
+        self.attention = try V4Attention(device: model.device, maxContext: maxContext)
+        self.qkv = try V4QKVEpilogue(device: model.device)
+        self.rope = try V4RoPE(device: model.device)
+        self.hc = try V4HyperConnections(device: model.device)
+        self.outProj = try V4OutputProjection(device: model.device)
+        self.hca = try V4HCACompressor(device: model.device)
+        self.moe = try MoEV4(context: context)
+        self.glue = try V4DecodeGlue(context: context)
+        self.fp8 = try DequantFP8BlockGEMV(context: context)
+
+        func scratch(_ floats: Int, _ label: String) throws -> MTLBuffer {
+            guard let b = model.device.makeBuffer(length: floats * 4,
+                                                  options: .storageModeShared) else {
+                throw MetalError.missingFunction("v4 runner scratch: \(label)")
+            }
+            return b
+        }
+        func scratch16(_ elems: Int, _ label: String) throws -> MTLBuffer {
+            guard let b = model.device.makeBuffer(
+                    length: elems * MemoryLayout<Float16>.size,
+                    options: .storageModeShared) else {
+                throw MetalError.missingFunction("v4 runner scratch: \(label)")
+            }
+            return b
+        }
+        let dim = model.config.hiddenSize
+        let heads = model.config.numHeads
+        let headDim = model.config.headDim
+        self.stream = try scratch(model.config.hcMult * dim, "stream")
+        self.branch = try scratch(dim, "branch")
+        self.xNorm = try scratch16(dim, "xNorm")
+        self.q = try scratch16(heads * headDim, "q")
+        self.indexQ = try scratch16(heads * 128, "indexQ")
+        self.indexW = try scratch(heads, "indexW")
+        self.attnOut = try scratch16(heads * headDim, "attnOut")
+        self.oProjOut = try scratch16(dim, "oProjOut")
+        self.routerIdx = try scratch(4, "routerIdx")
+        self.routerWts = try scratch(8, "routerWts")
+        self.routerLogits = try scratch(model.config.numExperts, "routerLogits")
+        self.acts = try scratch16(6 * model.config.moeIntermediateSize, "acts")
+        self.sharedGate = try scratch16(model.config.moeIntermediateSize, "sharedGate")
+        self.sharedUp = try scratch16(model.config.moeIntermediateSize, "sharedUp")
+        self.sharedAct = try scratch16(model.config.moeIntermediateSize, "sharedAct")
+        self.sharedOut = try scratch16(dim, "sharedOut")
+        self.ffnOut = try scratch16(dim, "ffnOut")
+        self.slotUpload = try scratch(4, "slotUpload")
+        self.idUpload = try scratch(4, "idUpload")
+        self.logits = try scratch(model.config.vocabSize, "logits")
+        self.csaPrevKV = try scratch(4 * 1024, "csaPrevKV")
+        self.csaCurKV = try scratch(4 * 1024, "csaCurKV")
+        self.csaPrevGate = try scratch(4 * 1024, "csaPrevGate")
+        self.csaCurGate = try scratch(4 * 1024, "csaCurGate")
+        self.idxPrevKV = try scratch(4 * 128, "idxPrevKV")
+        self.idxCurKV = try scratch(4 * 128, "idxCurKV")
+        self.idxPrevGate = try scratch(4 * 128, "idxPrevGate")
+        self.idxCurGate = try scratch(4 * 128, "idxCurGate")
+        self.hcaRingKV = try scratch(128 * 512, "hcaRingKV")
+        self.hcaRingGate = try scratch(128 * 512, "hcaRingGate")
+        self.rowScratch = try scratch(1024, "rowScratch")
+        self.rowScratch2 = try scratch(1024, "rowScratch2")
+    }
+
+    // MARK: - Decode step
+
+    /// Embed `token` into the fp32 mHC stream, then run one decode token
+    /// through the full stack. Returns the fp32 logits buffer (valid until
+    /// the next call). `position` is the absolute 0-based token index.
+    func forward(token: UInt32, position: Int) async throws -> MTLBuffer {
+        let tokenCount = position + 1
+
+        for layer in 0..<model.config.numLayers {
+            let kind = cache.layerKind(layer)
+            let ropeCfg = V4RoPE.Config.forLayer(kind)
+
+            // ---- cb1: boundaries, attention, router ----------------------
+            guard let cb1 = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+            if layer == 0 {
+                let table = try model.embedding
+                glue.encodeEmbedBroadcast(commandBuffer: cb1,
+                                          table: table.buffer,
+                                          tableOffset: Int(table.offset),
+                                          out: stream, token: token,
+                                          dim: UInt32(dim), streams: UInt32(streams))
+            }
+
+            let hcA = try (model.hcAttnFn(layer: layer),
+                           model.hcAttnBase(layer: layer),
+                           model.hcAttnScale(layer: layer))
+            hc.encodeParams(commandBuffer: cb1, x: stream,
+                            hcFn: hcA.0.buffer, hcFnOffset: Int(hcA.0.offset),
+                            hcBase: hcA.1.buffer, hcBaseOffset: Int(hcA.1.offset),
+                            hcScale: hcA.2.buffer, hcScaleOffset: Int(hcA.2.offset),
+                            dim: dim, normEps: eps, hcEps: Float(model.config.hcEps))
+            hc.encodePre(commandBuffer: cb1, x: stream, out: branch, dim: dim)
+            let attnNorm = try model.attnNorm(layer: layer)
+            glue.encodeRMSNormF32In(commandBuffer: cb1, x: branch,
+                                    w: attnNorm.buffer, wOffset: Int(attnNorm.offset),
+                                    out: xNorm, dim: UInt32(dim), eps: eps)
+
+            let weights = try attentionWeights(layer: layer, kind: kind)
+            let slot = cache.windowSlot(layer: layer, position: position)
+            qkv.encodeDecode(commandBuffer: cb1, x: xNorm, position: position,
+                             weights: weights, rope: ropeCfg, qOut: q,
+                             windowSlot: .init(buffer: slot.buffer, offset: slot.offset),
+                             compressorWKVOut: kind == .passthrough ? nil : rowScratch,
+                             compressorWGateOut: kind == .passthrough ? nil : rowScratch2,
+                             indexQOut: kind == .csa ? indexQ : nil,
+                             normEps: eps)
+            stageCompressorRows(commandBuffer: cb1, layer: layer, kind: kind,
+                                position: position)
+            if kind != .passthrough,
+               cache.completesGroup(layer: layer, tokenPosition: position) {
+                flushGroup(commandBuffer: cb1, layer: layer, kind: kind,
+                           position: position, ropeCfg: ropeCfg)
+            }
+            try encodeAttention(commandBuffer: cb1, layer: layer, kind: kind,
+                                tokenCount: tokenCount, ropeCfg: ropeCfg)
+
+            rope.encode(commandBuffer: cb1, x: attnOut,
+                        rows: model.config.numHeads, width: model.config.headDim,
+                        ropeDim: model.config.qkRopeHeadDim,
+                        position: -Float(position), inverse: true, config: ropeCfg)
+            let woA = try model.woA(layer: layer)
+            let woB = try model.woB(layer: layer)
+            outProj.encode(commandBuffer: cb1, o: attnOut,
+                           woA: woA.buffer, woAOffset: Int(woA.offset),
+                           woBWeights: woB.buffer, woBWeightsOffset: Int(woB.offset),
+                           woBScales: woB.buffer, woBScalesOffset: Int(woB.scaleOffset),
+                           out: oProjOut)
+            hc.encodePost(commandBuffer: cb1, residual: stream,
+                          sublayer: oProjOut, out: stream, dim: dim)
+
+            let hcF = try (model.hcFfnFn(layer: layer),
+                           model.hcFfnBase(layer: layer),
+                           model.hcFfnScale(layer: layer))
+            hc.encodeParams(commandBuffer: cb1, x: stream,
+                            hcFn: hcF.0.buffer, hcFnOffset: Int(hcF.0.offset),
+                            hcBase: hcF.1.buffer, hcBaseOffset: Int(hcF.1.offset),
+                            hcScale: hcF.2.buffer, hcScaleOffset: Int(hcF.2.offset),
+                            dim: dim, normEps: eps, hcEps: Float(model.config.hcEps))
+            hc.encodePre(commandBuffer: cb1, x: stream, out: branch, dim: dim)
+            let ffnNorm = try model.ffnNorm(layer: layer)
+            glue.encodeRMSNormF32In(commandBuffer: cb1, x: branch,
+                                    w: ffnNorm.buffer, wOffset: Int(ffnNorm.offset),
+                                    out: xNorm, dim: UInt32(dim), eps: eps)
+            let isHash = model.config.isHashRouted(layer: layer)
+            if !isHash {
+                let gate = try model.routerWeight(layer: layer)
+                let bias = try model.routerBias(layer: layer)
+                moe.encodeRouterV4(commandBuffer: cb1,
+                                   weights: gate.buffer, weightsOffset: Int(gate.offset),
+                                   bias: bias.buffer, biasOffset: Int(bias.offset),
+                                   hidden: xNorm,
+                                   outIndices: routerIdx, outWeights: routerWts,
+                                   numExperts: UInt32(numExperts), d: UInt32(dim),
+                                   routeScale: routeScale)
+            }
+            cb1.commit()
+            await cb1.completed()
+
+            // ---- io: expert plan + async fetch ----------------------------
+            let expertIDs: [Int]
+            if isHash {
+                expertIDs = try model.hashExpertIDs(layer: layer, token: token)
+            } else {
+                let ptr = routerIdx.contents().assumingMemoryBound(to: Int32.self)
+                expertIDs = (0..<topK).map { Int(ptr[$0]) }
+            }
+            let plan = try model.planRoutedExperts(layer: layer, experts: expertIDs)
+            let missSet = Set(plan.misses)
+            let hitSlots = plan.assignedSlots.indices
+                .filter { !missSet.contains($0) }
+                .map { plan.assignedSlots[$0] }
+            let blobs = try model.routedExpertBuffers(for: plan).map(\.buffer)
+            let offsets = model.routedExpertV4Offsets(layer: layer)
+            let argBuffer = moe.makeReusedRoutedArgumentBuffer(routedBlobs: blobs,
+                                                               topK: UInt32(topK))
+
+            // ---- cb2: shared expert + hit-subset phase 1 ------------------
+            guard let cb2 = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+            try encodeSharedExpert(commandBuffer: cb2, layer: layer)
+            if isHash {
+                let gate = try model.routerWeight(layer: layer)
+                glue.encodeBF16GEMV(commandBuffer: cb2,
+                                    weights: gate.buffer, weightsOffset: Int(gate.offset),
+                                    x: xNorm, out: routerLogits,
+                                    m: UInt32(numExperts), d: UInt32(dim))
+                uploadInts(expertIDs.map { Int32($0) }, to: idUpload)
+                glue.encodeRouterWeightsAtIndices(commandBuffer: cb2,
+                                                  logits: routerLogits,
+                                                  indices: idUpload,
+                                                  outWeights: routerWts,
+                                                  k: UInt32(topK),
+                                                  routeScale: routeScale)
+            }
+            if !hitSlots.isEmpty {
+                uploadUInts(hitSlots.map { UInt32($0) }, to: slotUpload)
+                moe.encodeRoutedPhase1SwiGLUSubset(commandBuffer: cb2,
+                                                   routedArgBuffer: argBuffer,
+                                                   routedBlobs: blobs,
+                                                   routedOffsets: offsets,
+                                                   x: xNorm, acts: acts,
+                                                   activeSlots: slotUpload,
+                                                   activeSlotIndices: hitSlots.map { UInt32($0) },
+                                                   activeCount: UInt32(hitSlots.count),
+                                                   d: UInt32(dim), f: UInt32(ffn),
+                                                   topK: UInt32(topK))
+            }
+            cb2.commit()
+
+            // Await the miss reads, then finish the layer.
+            _ = try await model.fetchRoutedExperts(plan: plan)
+
+            guard let cb3 = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+            let missSlots = plan.misses.map { plan.assignedSlots[$0] }
+            if !missSlots.isEmpty {
+                uploadUInts(missSlots.map { UInt32($0) }, to: slotUpload)
+                moe.encodeRoutedPhase1SwiGLUSubset(commandBuffer: cb3,
+                                                   routedArgBuffer: argBuffer,
+                                                   routedBlobs: blobs,
+                                                   routedOffsets: offsets,
+                                                   x: xNorm, acts: acts,
+                                                   activeSlots: slotUpload,
+                                                   activeSlotIndices: missSlots.map { UInt32($0) },
+                                                   activeCount: UInt32(missSlots.count),
+                                                   d: UInt32(dim), f: UInt32(ffn),
+                                                   topK: UInt32(topK))
+            }
+            moe.encodeRoutedPhase2Reduce(commandBuffer: cb3,
+                                         routedArgBuffer: argBuffer,
+                                         routedBlobs: blobs,
+                                         routedOffsets: offsets,
+                                         acts: acts,
+                                         routingWeights: routerWts,
+                                         residual: sharedOut,
+                                         y: ffnOut,
+                                         d: UInt32(dim), f: UInt32(ffn),
+                                         topK: UInt32(topK))
+            hc.encodePost(commandBuffer: cb3, residual: stream,
+                          sublayer: ffnOut, out: stream, dim: dim)
+            cb3.commit()
+            await cb3.completed()
+        }
+
+        // One cache position advance per token, after every layer consumed
+        // this token's rows.
+        cache.advance()
+
+        // ---- head: pre-only mHC boundary, final norm, fp32 lm_head -------
+        guard let cbH = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+        let hcH = try (model.hcHeadFn, model.hcHeadBase, model.hcHeadScale)
+        hc.encodeHeadParams(commandBuffer: cbH, x: stream,
+                            hcFn: hcH.0.buffer, hcFnOffset: Int(hcH.0.offset),
+                            hcBase: hcH.1.buffer, hcBaseOffset: Int(hcH.1.offset),
+                            hcScale: hcH.2.buffer, hcScaleOffset: Int(hcH.2.offset),
+                            dim: dim, normEps: eps, hcEps: Float(model.config.hcEps))
+        hc.encodePre(commandBuffer: cbH, x: stream, out: branch, dim: dim)
+        let finalNorm = try model.finalNorm
+        glue.encodeRMSNormF32In(commandBuffer: cbH, x: branch,
+                                w: finalNorm.buffer, wOffset: Int(finalNorm.offset),
+                                out: xNorm, dim: UInt32(dim), eps: eps)
+        let head = try model.lmHead
+        glue.encodeGemvF32(commandBuffer: cbH,
+                           weights: head.buffer, weightsOffset: Int(head.offset),
+                           x: xNorm, out: logits,
+                           m: UInt32(model.config.vocabSize), n: UInt32(dim))
+        cbH.commit()
+        await cbH.completed()
+        return logits
+    }
+
+    // MARK: - Per-layer assembly
+
+    private func attentionWeights(layer: Int, kind: V4LayerKind) throws
+        -> V4QKVEpilogue.Weights {
+        let wqA = try model.wqA(layer: layer)
+        let wqB = try model.wqB(layer: layer)
+        let wkv = try model.wkv(layer: layer)
+        let qNorm = try model.attnQNorm(layer: layer)
+        let kvNorm = try model.attnKVNorm(layer: layer)
+        var w = V4QKVEpilogue.Weights(
+            wqA: (wqA.buffer, wqA.buffer),
+            wqB: (wqB.buffer, wqB.buffer),
+            qNormGamma: qNorm.buffer,
+            windowWKV: (wkv.buffer, wkv.buffer),
+            kvNormGamma: kvNorm.buffer,
+            compressorWKV: nil, compressorWGate: nil, indexerWqB: nil)
+        w.wqACodesOffset = Int(wqA.offset)
+        w.wqAScalesOffset = Int(wqA.scaleOffset)
+        w.wqBCodesOffset = Int(wqB.offset)
+        w.wqBScalesOffset = Int(wqB.scaleOffset)
+        w.qNormGammaOffset = Int(qNorm.offset)
+        w.windowWKVCodesOffset = Int(wkv.offset)
+        w.windowWKVScalesOffset = Int(wkv.scaleOffset)
+        w.kvNormGammaOffset = Int(kvNorm.offset)
+        if kind != .passthrough {
+            let cwkv = try model.compressorWKV(layer: layer)
+            let cwg = try model.compressorWGate(layer: layer)
+            w.compressorWKV = cwkv.buffer
+            w.compressorWGate = cwg.buffer
+            w.compressorWKVOffset = Int(cwkv.offset)
+            w.compressorWGateOffset = Int(cwg.offset)
+            w.compressorOutDim = kind == .csa ? 1024 : 512
+        }
+        if kind == .csa {
+            let iqb = try model.indexerWQB(layer: layer)
+            w.indexerWqB = (iqb.buffer, iqb.buffer)
+            w.indexerWqBCodesOffset = Int(iqb.offset)
+            w.indexerWqBScalesOffset = Int(iqb.scaleOffset)
+        }
+        return w
+    }
+
+    /// Stage this token's compressor projection rows into the group
+    /// accumulators. The epilogue writes one row at offset 0 of the
+    /// scratch buffers; rows land by position within the current group.
+    private func stageCompressorRows(commandBuffer cb: MTLCommandBuffer,
+                                     layer: Int, kind: V4LayerKind, position: Int) {
+        guard kind != .passthrough else { return }
+        let ratio = model.config.compressRatios[layer]
+        let rowInGroup = position % ratio
+        if kind == .csa {
+            blitRow(commandBuffer: cb, from: rowScratch, to: csaCurKV,
+                    rowBytes: 1024 * 4, row: rowInGroup)
+            blitRow(commandBuffer: cb, from: rowScratch2, to: csaCurGate,
+                    rowBytes: 1024 * 4, row: rowInGroup)
+            // Indexer series: separate 128-dim fp32 projections.
+            if let ikv = try? model.indexerCompressorWKV(layer: layer),
+               let ig = try? model.indexerCompressorWGate(layer: layer) {
+                glue.encodeGemvF32(commandBuffer: cb,
+                                   weights: ikv.buffer, weightsOffset: Int(ikv.offset),
+                                   x: xNorm, out: rowScratch,
+                                   m: 128, n: UInt32(dim))
+                glue.encodeGemvF32(commandBuffer: cb,
+                                   weights: ig.buffer, weightsOffset: Int(ig.offset),
+                                   x: xNorm, out: rowScratch2,
+                                   m: 128, n: UInt32(dim))
+                blitRow(commandBuffer: cb, from: rowScratch, to: idxCurKV,
+                        rowBytes: 128 * 4, row: rowInGroup)
+                blitRow(commandBuffer: cb, from: rowScratch2, to: idxCurGate,
+                        rowBytes: 128 * 4, row: rowInGroup)
+            }
+        } else {
+            blitRow(commandBuffer: cb, from: rowScratch, to: hcaRingKV,
+                    rowBytes: 512 * 4, row: rowInGroup)
+            blitRow(commandBuffer: cb, from: rowScratch2, to: hcaRingGate,
+                    rowBytes: 512 * 4, row: rowInGroup)
+        }
+    }
+
+    private func blitRow(commandBuffer cb: MTLCommandBuffer,
+                         from src: MTLBuffer, to dst: MTLBuffer,
+                         rowBytes: Int, row: Int) {
+        guard let blit = cb.makeBlitCommandEncoder() else { return }
+        blit.copy(from: src, sourceOffset: 0,
+                  to: dst, destinationOffset: row * rowBytes,
+                  size: rowBytes)
+        blit.endEncoding()
+    }
+
+    private func blitWhole(commandBuffer cb: MTLCommandBuffer,
+                           from src: MTLBuffer, to dst: MTLBuffer, bytes: Int) {
+        guard let blit = cb.makeBlitCommandEncoder() else { return }
+        blit.copy(from: src, sourceOffset: 0, to: dst, destinationOffset: 0,
+                  size: bytes)
+        blit.endEncoding()
+    }
+
+    /// Flush the group completing at `position` into the cache's compressed
+    /// slots (and, for CSA, the indexer slot), then roll the current group
+    /// accumulators into the previous-group slots for the overlap.
+    private func flushGroup(commandBuffer cb: MTLCommandBuffer,
+                            layer: Int, kind: V4LayerKind, position: Int,
+                            ropeCfg: V4RoPE.Config) {
+        let group = cache.groupIndex(layer: layer, tokenPosition: position)
+        let slot = cache.compressedSlot(layer: layer, group: group)
+        let ropePos = UInt32(cache.ropePosition(layer: layer, group: group))
+        switch kind {
+        case .csa:
+            attention.encodeCSACompressGroup(
+                commandBuffer: cb,
+                prevKV: csaPrevKV, curKV: csaCurKV,
+                prevGate: csaPrevGate, curGate: csaCurGate,
+                ape: (try? model.compressorAPE(layer: layer))?.buffer ?? rowScratch,
+                gamma: (try? model.compressorNorm(layer: layer))?.buffer ?? rowScratch,
+                outValues: slot.values.buffer, valuesOffset: slot.values.offset,
+                outScales: slot.scales.buffer, scalesOffset: slot.scales.offset,
+                outRope: slot.rope.buffer, ropeOffset: slot.rope.offset,
+                ropePosition: ropePos,
+                ropeTheta: Float(model.config.compressRopeTheta),
+                yarnFactor: Float(model.config.yarnFactor),
+                originalSeqLen: Float(model.config.yarnOriginalMaxPositions),
+                betaFast: Float(model.config.yarnBetaFast),
+                betaSlow: Float(model.config.yarnBetaSlow),
+                useYarn: true, normEps: eps)
+            let idxSlot = cache.indexerSlot(layer: layer, group: group)
+            glue.encodeIndexerCompressGroup(
+                commandBuffer: cb,
+                prevKV: idxPrevKV, curKV: idxCurKV,
+                prevGate: idxPrevGate, curGate: idxCurGate,
+                ape: (try? model.indexerCompressorAPE(layer: layer))?.buffer ?? rowScratch,
+                gamma: (try? model.indexerCompressorNorm(layer: layer))?.buffer ?? rowScratch,
+                out: idxSlot.buffer, outOffset: idxSlot.offset,
+                ropePosition: ropePos, rope: ropeCfg, normEps: eps)
+            // Roll: the current group becomes the previous group for the
+            // next entry's overlapped pooling window.
+            blitWhole(commandBuffer: cb, from: csaCurKV, to: csaPrevKV, bytes: 4 * 1024 * 4)
+            blitWhole(commandBuffer: cb, from: csaCurGate, to: csaPrevGate, bytes: 4 * 1024 * 4)
+            blitWhole(commandBuffer: cb, from: idxCurKV, to: idxPrevKV, bytes: 4 * 128 * 4)
+            blitWhole(commandBuffer: cb, from: idxCurGate, to: idxPrevGate, bytes: 4 * 128 * 4)
+        case .hca:
+            hca.encodeGroup(commandBuffer: cb,
+                            kv: hcaRingKV, gate: hcaRingGate,
+                            ape: (try? model.compressorAPE(layer: layer))?.buffer ?? rowScratch,
+                            gamma: (try? model.compressorNorm(layer: layer))?.buffer ?? rowScratch,
+                            outValues: slot.values.buffer, valuesOffset: slot.values.offset,
+                            outScales: slot.scales.buffer, scalesOffset: slot.scales.offset,
+                            outRope: slot.rope.buffer, ropeOffset: slot.rope.offset,
+                            ropePosition: ropePos, rope: ropeCfg, normEps: eps)
+        case .passthrough:
+            break
+        }
+    }
+
+    private func encodeAttention(commandBuffer cb: MTLCommandBuffer,
+                                 layer: Int, kind: V4LayerKind,
+                                 tokenCount: Int,
+                                 ropeCfg: V4RoPE.Config) throws {
+        let sinks = try model.attnSink(layer: layer)
+        let window = cache.windowBuffer(layer: layer)
+        let windowStart = max(0, tokenCount - model.config.slidingWindow)
+        switch kind {
+        case .passthrough:
+            attention.encodeWindowMQADecode(commandBuffer: cb, q: q,
+                                            windowK: window, tokenCount: tokenCount,
+                                            sinks: sinks.buffer,
+                                            sinksOffset: Int(sinks.offset),
+                                            out: attnOut)
+        case .csa:
+            // Indexer per-head weights: h . W^w (BF16 [indexNHeads, dim]).
+            let wproj = try model.indexerWeightsProj(layer: layer)
+            glue.encodeBF16GEMV(commandBuffer: cb,
+                                weights: wproj.buffer, weightsOffset: Int(wproj.offset),
+                                x: xNorm, out: indexW,
+                                m: UInt32(model.config.indexNHeads), d: UInt32(dim))
+            let base = cache.compressedSlot(layer: layer, group: 0)
+            attention.encodeCSADecode(commandBuffer: cb, q: q,
+                                      indexQ: indexQ,
+                                      indexKV: cache.indexerBuffer(layer: layer),
+                                      indexWeights: indexW,
+                                      nVisible: cache.visibleGroupCount(
+                                          layer: layer, windowStart: windowStart),
+                                      compressedValues: base.values.buffer,
+                                      compressedScales: base.scales.buffer,
+                                      compressedRope: base.rope.buffer,
+                                      windowK: window, tokenCount: tokenCount,
+                                      sinks: sinks.buffer, sinksOffset: Int(sinks.offset),
+                                      out: attnOut)
+        case .hca:
+            let base = cache.compressedSlot(layer: layer, group: 0)
+            attention.encodeHCADecode(commandBuffer: cb, q: q,
+                                      nVisible: cache.visibleGroupCount(
+                                          layer: layer, windowStart: windowStart),
+                                      compressedValues: base.values.buffer,
+                                      compressedScales: base.scales.buffer,
+                                      compressedRope: base.rope.buffer,
+                                      windowK: window, tokenCount: tokenCount,
+                                      sinks: sinks.buffer, sinksOffset: Int(sinks.offset),
+                                      out: attnOut)
+        }
+    }
+
+    /// Resident shared expert: FP8 w1/w3 -> clamped SwiGLU -> FP8 w2.
+    private func encodeSharedExpert(commandBuffer cb: MTLCommandBuffer,
+                                    layer: Int) throws {
+        let w1 = try model.sharedExpertW1(layer: layer)
+        let w3 = try model.sharedExpertW3(layer: layer)
+        let w2 = try model.sharedExpertW2(layer: layer)
+        fp8.encode(commandBuffer: cb,
+                   weights: w1.buffer, weightsOffset: Int(w1.offset),
+                   scales: w1.buffer, scalesOffset: Int(w1.scaleOffset),
+                   x: xNorm, y: sharedGate,
+                   m: UInt32(ffn), n: UInt32(dim))
+        fp8.encode(commandBuffer: cb,
+                   weights: w3.buffer, weightsOffset: Int(w3.offset),
+                   scales: w3.buffer, scalesOffset: Int(w3.scaleOffset),
+                   x: xNorm, y: sharedUp,
+                   m: UInt32(ffn), n: UInt32(dim))
+        glue.encodeSwiGLUAct(commandBuffer: cb, gate: sharedGate, up: sharedUp,
+                             act: sharedAct, n: UInt32(ffn), limit: swigluLimit)
+        fp8.encode(commandBuffer: cb,
+                   weights: w2.buffer, weightsOffset: Int(w2.offset),
+                   scales: w2.buffer, scalesOffset: Int(w2.scaleOffset),
+                   x: sharedAct, y: sharedOut,
+                   m: UInt32(dim), n: UInt32(ffn))
+    }
+
+    // MARK: - Small utilities
+
+    private func uploadInts(_ values: [Int32], to buffer: MTLBuffer) {
+        let ptr = buffer.contents().assumingMemoryBound(to: Int32.self)
+        for (i, v) in values.enumerated() { ptr[i] = v }
+    }
+
+    private func uploadUInts(_ values: [UInt32], to buffer: MTLBuffer) {
+        let ptr = buffer.contents().assumingMemoryBound(to: UInt32.self)
+        for (i, v) in values.enumerated() { ptr[i] = v }
+    }
+}
