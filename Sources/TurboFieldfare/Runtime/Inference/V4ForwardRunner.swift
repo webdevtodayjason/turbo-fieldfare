@@ -19,12 +19,31 @@ import Metal
 /// - `cb3` runs the miss-subset phase 1, the weighted phase-2 reduce
 ///   (shared-expert output as the residual add), and the mHC ffn post.
 ///
-/// Recorded v1 simplifications (follow-ups, not oversights):
+/// Cross-layer pipelining (V4F-06a): the per-layer `waitUntilCompleted`
+/// stalls are removed. GPU-side ordering needs no scratch duplication:
+/// every layer's cb3 writes `stream` and the next layer's cb1 reads it, so
+/// on one command queue Metal's hazard tracking serializes layers in
+/// commit order exactly like the explicit waits did. The CPU-side waits
+/// that remain:
 ///
-/// - Layers are serialized: cb3 completes before the next layer's plan,
-///   so a later layer's cache plan can never evict a slot that queued GPU
-///   work still owns. Cross-layer pipelining with `avoidingSlots` is the
-///   V4F-04 follow-up that recovers the Gemma pipeline depth.
+/// - cb1 is awaited only on router layers, and only to read back the
+///   top-6 indices; hash layers (resident tid2eid table) skip the wait.
+/// - CPU-uploaded staging (hit/miss slot lists, hash ids) is a ring of 2
+///   by layer parity; a layer drains the previous occupant of its parity
+///   (layer N-2's cb2/cb3) before rewriting, bounding GPU lag to one
+///   layer without ever letting the CPU write a buffer queued work reads.
+/// - The routed argument buffer is fresh per layer (`makeRoutedArgumentBuffer`);
+///   the reused singleton would be re-encoded while a prior layer's
+///   cb2/cb3 still references it.
+///
+/// Slot ownership needs no `avoidingSlots`: each layer's
+/// `PreadExpertStreamer` owns a disjoint slot pool, so a later layer's
+/// plan can never evict a slot an earlier layer's queued GPU work reads,
+/// and the per-token head wait guarantees same-layer eviction safety
+/// across tokens.
+///
+/// Recorded simplifications (follow-ups, not oversights):
+///
 /// - Decode only. Prefill is the V4F-06 work item.
 /// - The compressor epilogue writes one fp32 row at offset 0 of a scratch
 ///   buffer per token; the runner blits rows into the group accumulators
@@ -77,9 +96,22 @@ public final class V4ForwardRunner {
     private let sharedAct: MTLBuffer     // [F] fp16
     private let sharedOut: MTLBuffer     // [dim] fp16 shared-expert output
     private let ffnOut: MTLBuffer        // [dim] fp16 shared + routed
-    private let slotUpload: MTLBuffer    // [6] uint32 active-slot list
-    private let idUpload: MTLBuffer      // [6] int32 hash-layer expert ids
     private let logits: MTLBuffer        // [vocab] fp32
+    /// CPU-uploaded expert staging, ring of 2 indexed by `layer & 1`.
+    /// Layer N's cb2/cb3 may still be queued when the CPU fills layer
+    /// N+2's lists, so each parity owns its copies; hit and miss lists are
+    /// separate because cb2 reads the hit list while the CPU writes the
+    /// miss list for cb3 of the SAME layer.
+    private struct UploadStaging {
+        let hit: MTLBuffer   // [6] uint32 hit-subset plan positions (cb2)
+        let miss: MTLBuffer  // [6] uint32 miss-subset plan positions (cb3)
+        let ids: MTLBuffer   // [6] int32 hash-layer expert ids (cb2)
+    }
+    private let uploadStaging: [UploadStaging]
+    /// The (cb2, cb3) most recently committed against each staging parity,
+    /// drained before that parity's buffers are rewritten and once after
+    /// the layer loop.
+    private var stagingInFlight: [(MTLCommandBuffer, MTLCommandBuffer)?] = [nil, nil]
     // Compressor group accumulators (fp32; kernels read from offset 0).
     private let csaPrevKV: MTLBuffer     // [4, 1024] fp32
     private let csaCurKV: MTLBuffer      // [4, 1024] fp32
@@ -154,9 +186,15 @@ public final class V4ForwardRunner {
         self.sharedAct = try scratch16(model.config.moeIntermediateSize, "sharedAct")
         self.sharedOut = try scratch16(dim, "sharedOut")
         self.ffnOut = try scratch16(dim, "ffnOut")
-        self.slotUpload = try scratch(4, "slotUpload")
-        self.idUpload = try scratch(4, "idUpload")
         self.logits = try scratch(model.config.vocabSize, "logits")
+        self.uploadStaging = [
+            UploadStaging(hit: try scratch(4, "slotUploadHit0"),
+                          miss: try scratch(4, "slotUploadMiss0"),
+                          ids: try scratch(4, "idUpload0")),
+            UploadStaging(hit: try scratch(4, "slotUploadHit1"),
+                          miss: try scratch(4, "slotUploadMiss1"),
+                          ids: try scratch(4, "idUpload1")),
+        ]
         self.csaPrevKV = try scratch(4 * 1024, "csaPrevKV")
         self.csaCurKV = try scratch(4 * 1024, "csaCurKV")
         self.csaPrevGate = try scratch(4 * 1024, "csaPrevGate")
@@ -310,7 +348,15 @@ public final class V4ForwardRunner {
                                    routeScale: routeScale)
             }
             cb1.commit()
-            await cb1.completed()
+            // The cb1 wait exists only for the router top-6 readback.
+            // Hash layers take ids from the resident tid2eid table, so
+            // their plan/fetch runs CPU-side with no GPU round trip; cb1
+            // stays queued behind the previous layer's cb3 via hazard
+            // tracking on `stream`.
+            if !isHash {
+                await cb1.completed()
+                if let error = cb1.error { throw error }
+            }
 
             // ---- io: expert plan + async fetch ----------------------------
             let expertIDs: [Int]
@@ -327,8 +373,27 @@ public final class V4ForwardRunner {
             let hitPositions = (0..<topK).filter { !missSet.contains($0) }
             let blobs = try model.routedExpertBuffers(for: plan).map(\.buffer)
             let offsets = model.routedExpertV4Offsets(layer: layer)
-            let argBuffer = moe.makeReusedRoutedArgumentBuffer(routedBlobs: blobs,
-                                                               topK: UInt32(topK))
+            // Fresh argument buffer per layer: the reused singleton would
+            // be CPU-re-encoded here while layer N-1's queued cb2/cb3
+            // still references it (a data race once cb3 waits are
+            // deferred). The command buffer retains what it encodes.
+            guard let argBuffer = moe.makeRoutedArgumentBuffer(routedBlobs: blobs,
+                                                               topK: UInt32(topK)) else {
+                throw MetalError.missingFunction("v4 routed argument buffer")
+            }
+
+            // Drain the previous occupant of this staging parity (layer
+            // N-2's cb2/cb3) before the CPU rewrites its upload buffers.
+            // Bounds GPU lag to one layer; usually free, because a router
+            // layer's cb1 wait already implies the older work finished.
+            let parity = layer & 1
+            let staging = uploadStaging[parity]
+            if let inFlight = stagingInFlight[parity] {
+                await inFlight.0.completed()
+                await inFlight.1.completed()
+                if let error = inFlight.0.error ?? inFlight.1.error { throw error }
+                stagingInFlight[parity] = nil
+            }
 
             // ---- cb2: shared expert + hit-subset phase 1 ------------------
             guard let cb2 = queue.makeCommandBuffer() else { throw MetalError.noQueue }
@@ -339,22 +404,22 @@ public final class V4ForwardRunner {
                                     weights: gate.buffer, weightsOffset: Int(gate.offset),
                                     x: xNorm, out: routerLogits,
                                     m: UInt32(numExperts), d: UInt32(dim))
-                uploadInts(expertIDs.map { Int32($0) }, to: idUpload)
+                uploadInts(expertIDs.map { Int32($0) }, to: staging.ids)
                 glue.encodeRouterWeightsAtIndices(commandBuffer: cb2,
                                                   logits: routerLogits,
-                                                  indices: idUpload,
+                                                  indices: staging.ids,
                                                   outWeights: routerWts,
                                                   k: UInt32(topK),
                                                   routeScale: routeScale)
             }
             if !hitPositions.isEmpty {
-                uploadUInts(hitPositions.map { UInt32($0) }, to: slotUpload)
+                uploadUInts(hitPositions.map { UInt32($0) }, to: staging.hit)
                 moe.encodeRoutedPhase1SwiGLUSubset(commandBuffer: cb2,
                                                    routedArgBuffer: argBuffer,
                                                    routedBlobs: blobs,
                                                    routedOffsets: offsets,
                                                    x: xNorm, acts: acts,
-                                                   activeSlots: slotUpload,
+                                                   activeSlots: staging.hit,
                                                    activeSlotIndices: hitPositions.map { UInt32($0) },
                                                    activeCount: UInt32(hitPositions.count),
                                                    d: UInt32(dim), f: UInt32(ffn),
@@ -368,13 +433,13 @@ public final class V4ForwardRunner {
             guard let cb3 = queue.makeCommandBuffer() else { throw MetalError.noQueue }
             let missPositions = plan.misses
             if !missPositions.isEmpty {
-                uploadUInts(missPositions.map { UInt32($0) }, to: slotUpload)
+                uploadUInts(missPositions.map { UInt32($0) }, to: staging.miss)
                 moe.encodeRoutedPhase1SwiGLUSubset(commandBuffer: cb3,
                                                    routedArgBuffer: argBuffer,
                                                    routedBlobs: blobs,
                                                    routedOffsets: offsets,
                                                    x: xNorm, acts: acts,
-                                                   activeSlots: slotUpload,
+                                                   activeSlots: staging.miss,
                                                    activeSlotIndices: missPositions.map { UInt32($0) },
                                                    activeCount: UInt32(missPositions.count),
                                                    d: UInt32(dim), f: UInt32(ffn),
@@ -393,8 +458,26 @@ public final class V4ForwardRunner {
             hc.encodePost(commandBuffer: cb3, residual: stream,
                           sublayer: ffnOut, out: stream, dim: dim)
             cb3.commit()
-            await cb3.completed()
+            // No per-layer cb3 wait: the next layer's cb1 reads `stream`
+            // only on the GPU, and hazard tracking on one queue orders it
+            // behind this cb3. The pairing is recorded so the staging
+            // parity's drain (and the post-loop drain) can bound GPU lag
+            // and surface errors.
+            stagingInFlight[parity] = (cb2, cb3)
 
+        }
+
+        // Drain the pipeline once per token: every layer's GPU work is
+        // complete before the cache position advances and the head reads
+        // `stream`, which also keeps same-layer slot eviction across
+        // tokens safe (a token's plans never race its own queued reads).
+        for parity in 0..<uploadStaging.count {
+            if let inFlight = stagingInFlight[parity] {
+                await inFlight.0.completed()
+                await inFlight.1.completed()
+                if let error = inFlight.0.error ?? inFlight.1.error { throw error }
+                stagingInFlight[parity] = nil
+            }
         }
 
         // One cache position advance per token, after every layer consumed
