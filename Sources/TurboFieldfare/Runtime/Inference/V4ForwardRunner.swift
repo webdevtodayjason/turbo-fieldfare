@@ -112,19 +112,9 @@ public final class V4ForwardRunner {
     /// drained before that parity's buffers are rewritten and once after
     /// the layer loop.
     private var stagingInFlight: [(MTLCommandBuffer, MTLCommandBuffer)?] = [nil, nil]
-    // Compressor group accumulators (fp32; kernels read from offset 0).
-    private let csaPrevKV: MTLBuffer     // [4, 1024] fp32
-    private let csaCurKV: MTLBuffer      // [4, 1024] fp32
-    private let csaPrevGate: MTLBuffer   // [4, 1024] fp32
-    private let csaCurGate: MTLBuffer    // [4, 1024] fp32
-    private let idxPrevKV: MTLBuffer     // [4, 256] fp32 (indexer series)
-    private let idxCurKV: MTLBuffer      // [4, 256] fp32
-    private let idxPrevGate: MTLBuffer   // [4, 256] fp32
-    private let idxCurGate: MTLBuffer    // [4, 256] fp32
+    private let compressorAccumulators: V4CompressorAccumulatorStore
     private let lowRank: MTLBuffer       // [8192] fp16 o-proj stage 1
     private let headF32: MTLBuffer       // [vocab, dim] fp32 (converted)
-    private let hcaRingKV: MTLBuffer     // [128, 512] fp32
-    private let hcaRingGate: MTLBuffer   // [128, 512] fp32
     private let rowScratch: MTLBuffer    // [1024] fp32 epilogue single row
     private let rowScratch2: MTLBuffer   // [1024] fp32 second series
 
@@ -195,14 +185,9 @@ public final class V4ForwardRunner {
                           miss: try scratch(4, "slotUploadMiss1"),
                           ids: try scratch(4, "idUpload1")),
         ]
-        self.csaPrevKV = try scratch(4 * 1024, "csaPrevKV")
-        self.csaCurKV = try scratch(4 * 1024, "csaCurKV")
-        self.csaPrevGate = try scratch(4 * 1024, "csaPrevGate")
-        self.csaCurGate = try scratch(4 * 1024, "csaCurGate")
-        self.idxPrevKV = try scratch(4 * 256, "idxPrevKV")
-        self.idxCurKV = try scratch(4 * 256, "idxCurKV")
-        self.idxPrevGate = try scratch(4 * 256, "idxPrevGate")
-        self.idxCurGate = try scratch(4 * 256, "idxCurGate")
+        self.compressorAccumulators = try V4CompressorAccumulatorStore(
+            device: model.device,
+            layerKinds: cacheConfig.compressRatios.indices.map { cacheConfig.kind(layer: $0) })
         self.lowRank = try scratch16(8192, "lowRank")
         // head.weight ships BF16; v4b_gemv_f32 wants fp32. Exact one-time
         // widening (bf16 bits << 16) at init.
@@ -216,8 +201,6 @@ public final class V4ForwardRunner {
                        dst: headBuf.contents(),
                        count: model.config.vocabSize * model.config.hiddenSize)
         self.headF32 = headBuf
-        self.hcaRingKV = try scratch(128 * 512, "hcaRingKV")
-        self.hcaRingGate = try scratch(128 * 512, "hcaRingGate")
         self.rowScratch = try scratch(1024, "rowScratch")
         self.rowScratch2 = try scratch(1024, "rowScratch2")
     }
@@ -563,9 +546,10 @@ public final class V4ForwardRunner {
                                 m: outDim, d: UInt32(dim))
         }
         if kind == .csa {
-            blitRow(commandBuffer: cb, from: rowScratch, to: csaCurKV,
+            let state = compressorAccumulators.csa(layer: layer)
+            blitRow(commandBuffer: cb, from: rowScratch, to: state.curKV,
                     rowBytes: 1024 * 4, row: rowInGroup)
-            blitRow(commandBuffer: cb, from: rowScratch2, to: csaCurGate,
+            blitRow(commandBuffer: cb, from: rowScratch2, to: state.curGate,
                     rowBytes: 1024 * 4, row: rowInGroup)
             // Indexer series: 256-dim rows (two 128-dim overlapped series).
             if let ikv = try? model.indexerCompressorWKV(layer: layer),
@@ -578,15 +562,16 @@ public final class V4ForwardRunner {
                                     weights: ig.buffer, weightsOffset: Int(ig.offset),
                                     x: xNorm, out: rowScratch2,
                                     m: 256, d: UInt32(dim))
-                blitRow(commandBuffer: cb, from: rowScratch, to: idxCurKV,
+                blitRow(commandBuffer: cb, from: rowScratch, to: state.idxCurKV,
                         rowBytes: 256 * 4, row: rowInGroup)
-                blitRow(commandBuffer: cb, from: rowScratch2, to: idxCurGate,
+                blitRow(commandBuffer: cb, from: rowScratch2, to: state.idxCurGate,
                         rowBytes: 256 * 4, row: rowInGroup)
             }
         } else {
-            blitRow(commandBuffer: cb, from: rowScratch, to: hcaRingKV,
+            let state = compressorAccumulators.hca(layer: layer)
+            blitRow(commandBuffer: cb, from: rowScratch, to: state.ringKV,
                     rowBytes: 512 * 4, row: rowInGroup)
-            blitRow(commandBuffer: cb, from: rowScratch2, to: hcaRingGate,
+            blitRow(commandBuffer: cb, from: rowScratch2, to: state.ringGate,
                     rowBytes: 512 * 4, row: rowInGroup)
         }
     }
@@ -601,14 +586,6 @@ public final class V4ForwardRunner {
         blit.endEncoding()
     }
 
-    private func blitWhole(commandBuffer cb: MTLCommandBuffer,
-                           from src: MTLBuffer, to dst: MTLBuffer, bytes: Int) {
-        guard let blit = cb.makeBlitCommandEncoder() else { return }
-        blit.copy(from: src, sourceOffset: 0, to: dst, destinationOffset: 0,
-                  size: bytes)
-        blit.endEncoding()
-    }
-
     /// Flush the group completing at `position` into the cache's compressed
     /// slots (and, for CSA, the indexer slot), then roll the current group
     /// accumulators into the previous-group slots for the overlap.
@@ -620,10 +597,11 @@ public final class V4ForwardRunner {
         let ropePos = UInt32(cache.ropePosition(layer: layer, group: group))
         switch kind {
         case .csa:
+            let state = compressorAccumulators.csa(layer: layer)
             attention.encodeCSACompressGroup(
                 commandBuffer: cb,
-                prevKV: csaPrevKV, curKV: csaCurKV,
-                prevGate: csaPrevGate, curGate: csaCurGate,
+                prevKV: state.prevKV, curKV: state.curKV,
+                prevGate: state.prevGate, curGate: state.curGate,
                 ape: (try? model.compressorAPE(layer: layer))?.buffer ?? rowScratch,
                 gamma: (try? model.compressorNorm(layer: layer))?.buffer ?? rowScratch,
                 outValues: slot.values.buffer, valuesOffset: slot.values.offset,
@@ -639,21 +617,19 @@ public final class V4ForwardRunner {
             let idxSlot = cache.indexerSlot(layer: layer, group: group)
             glue.encodeIndexerCompressGroup(
                 commandBuffer: cb,
-                prevKV: idxPrevKV, curKV: idxCurKV,
-                prevGate: idxPrevGate, curGate: idxCurGate,
+                prevKV: state.idxPrevKV, curKV: state.idxCurKV,
+                prevGate: state.idxPrevGate, curGate: state.idxCurGate,
                 ape: (try? model.indexerCompressorAPE(layer: layer))?.buffer ?? rowScratch,
                 gamma: (try? model.indexerCompressorNorm(layer: layer))?.buffer ?? rowScratch,
                 out: idxSlot.buffer, outOffset: idxSlot.offset,
                 ropePosition: ropePos, rope: ropeCfg, normEps: eps)
             // Roll: the current group becomes the previous group for the
             // next entry's overlapped pooling window.
-            blitWhole(commandBuffer: cb, from: csaCurKV, to: csaPrevKV, bytes: 4 * 1024 * 4)
-            blitWhole(commandBuffer: cb, from: csaCurGate, to: csaPrevGate, bytes: 4 * 1024 * 4)
-            blitWhole(commandBuffer: cb, from: idxCurKV, to: idxPrevKV, bytes: 4 * 128 * 4)
-            blitWhole(commandBuffer: cb, from: idxCurGate, to: idxPrevGate, bytes: 4 * 128 * 4)
+            compressorAccumulators.rollCSA(commandBuffer: cb, layer: layer)
         case .hca:
+            let state = compressorAccumulators.hca(layer: layer)
             hca.encodeGroup(commandBuffer: cb,
-                            kv: hcaRingKV, gate: hcaRingGate,
+                            kv: state.ringKV, gate: state.ringGate,
                             ape: (try? model.compressorAPE(layer: layer))?.buffer ?? rowScratch,
                             gamma: (try? model.compressorNorm(layer: layer))?.buffer ?? rowScratch,
                             outValues: slot.values.buffer, valuesOffset: slot.values.offset,
