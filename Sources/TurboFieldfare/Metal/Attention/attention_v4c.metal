@@ -23,17 +23,173 @@ using namespace metal;
 //                                  tid2eid indices, L1-normalized, scaled by
 //                                  route_scale. No bias (hash layers have
 //                                  none); selection is the table's.
+//   v4c_indexer_hadamard_fp4_qat   normalized 128-point WHT followed by
+//                                  block-32 e2m1/e8m0 quantize-dequantize.
+//   v4c_window_fp8_qat              window-KV non-RoPE FP8 activation
+//                                  quantize-dequantize, block size 64.
 //   v4c_indexer_compress_group     CSA lightning-indexer compressed-entry
 //                                  flush: overlapped 8-token softmax pooling
 //                                  at 128 dims + RMSNorm + group-start
-//                                  partial RoPE, FP16 out. The reference's
-//                                  Hadamard + FP4 QAT sim on indexer entries
-//                                  is NOT applied (parity seam recorded in
-//                                  the V4F-03 report; storage is FP16 per
-//                                  CompressedKVCacheManager).
+//                                  partial RoPE + the same WHT/FP4 QAT.
 // ============================================================================
 
 constant constexpr uint kV4CThreads = 256;
+constant constexpr uint kV4CIndexDim = 128;
+constant constexpr uint kV4CFP4Block = 32;
+
+static inline float v4c_block_reduce_sum(float value,
+                                         uint simd_lane_id,
+                                         uint simd_group_id,
+                                         uint simdgroups,
+                                         threadgroup float* scratch,
+                                         threadgroup float* broadcast) {
+    float sum = simd_sum(value);
+    if (simd_lane_id == 0) { scratch[simd_group_id] = sum; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float group = simd_lane_id < simdgroups ? scratch[simd_lane_id] : 0.0f;
+        group = simd_sum(group);
+        if (simd_lane_id == 0) { *broadcast = group; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return *broadcast;
+}
+
+inline int v4c_log2_ceil_positive(float x) {
+    const uint bits = as_type<uint>(x);
+    const int exponent = int((bits >> 23) & 0xFFu) - 127;
+    return exponent + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+}
+
+inline float v4c_pow2(int exponent) {
+    return as_type<float>(uint(exponent + 127) << 23);
+}
+
+inline float v4c_bf16_round(float value) {
+    uint bits = as_type<uint>(value);
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    return as_type<float>(bits & 0xFFFF0000u);
+}
+
+inline float v4c_fp4_roundtrip(float value, float scale) {
+    constexpr float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float q = min(fabs(value / scale), 6.0f);
+    uint best = 0;
+    float best_diff = INFINITY;
+    for (uint code = 0; code < 8; ++code) {
+        const float diff = fabs(levels[code] - q);
+        if (diff < best_diff || (diff == best_diff && (code & 1u) == 0u)) {
+            best = code;
+            best_diff = diff;
+        }
+    }
+    const float rounded = levels[best] * scale;
+    return value < 0.0f ? -rounded : rounded;
+}
+
+inline uchar v4c_e4m3_encode(float x) {
+    const uchar sign = x < 0.0f ? 0x80u : 0x00u;
+    const float ax = min(fabs(x), 448.0f);
+    if (ax < 0x1p-6f) {
+        const uint mantissa = uint(rint(ax * 512.0f));
+        if (mantissa >= 8u) { return sign | 0x08u; }
+        return sign | uchar(mantissa);
+    }
+    int exponent = int(floor(log2(ax)));
+    const float fractional = ax * exp2(float(-exponent)) - 1.0f;
+    uint mantissa = uint(rint(fractional * 8.0f));
+    if (mantissa == 8u) { mantissa = 0u; exponent += 1; }
+    if (exponent > 8) { return sign | 0x7Eu; }
+    return sign | uchar((uint(exponent + 7) << 3) | mantissa);
+}
+
+inline float v4c_e4m3_decode(uchar bits) {
+    const uint exponent = (uint(bits) >> 3) & 0xFu;
+    const uint mantissa = uint(bits & 0x7u);
+    const float magnitude = exponent == 0u
+        ? float(mantissa) * 0x1p-9f
+        : (1.0f + float(mantissa) * 0.125f) * exp2(float(int(exponent) - 7));
+    return (bits & 0x80u) != 0u ? -magnitude : magnitude;
+}
+
+// Reference rotate_activation + fp4_act_quant(inplace=True) for one or more
+// 128-dim indexer query rows. One threadgroup owns one row.
+[[kernel, max_total_threads_per_threadgroup(kV4CIndexDim)]]
+kernel void v4c_indexer_hadamard_fp4_qat(
+    device half* buf [[buffer(0)]],
+    constant uint& rows [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    if (row >= rows) { return; }
+    threadgroup float x[kV4CIndexDim];
+    threadgroup float scales[kV4CIndexDim / kV4CFP4Block];
+    device half* out = buf + row * kV4CIndexDim;
+    x[lid] = float(out[lid]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    constexpr float inv_sqrt_2 = 0.7071067811865475244f;
+    for (uint stride = 1; stride < kV4CIndexDim; stride <<= 1) {
+        if (lid < kV4CIndexDim / 2) {
+            const uint block = lid / stride;
+            const uint k = lid - block * stride;
+            const uint i0 = block * (stride << 1) + k;
+            const uint i1 = i0 + stride;
+            const float a = x[i0];
+            const float b = x[i1];
+            x[i0] = (a + b) * inv_sqrt_2;
+            x[i1] = (a - b) * inv_sqrt_2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid < kV4CIndexDim / kV4CFP4Block) {
+        float amax = 0.0f;
+        for (uint i = 0; i < kV4CFP4Block; ++i) {
+            amax = max(amax, fabs(x[lid * kV4CFP4Block + i]));
+        }
+        const float scaled_max = max(amax, 6.0f * 0x1p-126f) * (1.0f / 6.0f);
+        scales[lid] = v4c_pow2(v4c_log2_ceil_positive(scaled_max));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    out[lid] = half(v4c_fp4_roundtrip(x[lid], scales[lid / kV4CFP4Block]));
+}
+
+// Reference Attention.forward window-KV QAT simulation. Each row is 512
+// channels; only the first 448 non-RoPE channels are quantized in block-64
+// e4m3 with power-of-two ue8m0-equivalent scales. The trailing 64 RoPE
+// channels remain untouched for positional precision.
+[[kernel, max_total_threads_per_threadgroup(kV4CThreads)]]
+kernel void v4c_window_fp8_qat(
+    device half* buf [[buffer(0)]],
+    constant uint& rows [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    if (row >= rows) { return; }
+    constexpr uint width = 512;
+    constexpr uint non_rope = 448;
+    constexpr uint block = 64;
+    constexpr uint blocks = non_rope / block;
+    device half* values = buf + row * width;
+    threadgroup float scales[blocks];
+
+    if (lid < blocks) {
+        float amax = 0.0f;
+        for (uint i = 0; i < block; ++i) {
+            amax = max(amax, fabs(float(values[lid * block + i])));
+        }
+        const float raw_scale = max(amax, 1e-4f) * (1.0f / 448.0f);
+        scales[lid] = v4c_pow2(v4c_log2_ceil_positive(raw_scale));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = lid; d < non_rope; d += kV4CThreads) {
+        const float scale = scales[d / block];
+        const uchar code = v4c_e4m3_encode(float(values[d]) / scale);
+        values[d] = half(v4c_e4m3_decode(code) * scale);
+    }
+}
 
 inline float v4c_yarn_freq(uint pair,
                            float theta,
@@ -54,6 +210,85 @@ inline float v4c_yarn_freq(uint pair,
     const float ramp = clamp((float(pair) - low) / (high - low), 0.0f, 1.0f);
     const float smooth = 1.0f - ramp;
     return (freq / factor) * (1.0f - smooth) + freq * smooth;
+}
+
+// Decode-only fusion of window KV RMSNorm, trailing RoPE, and activation QAT.
+// The normalized values are explicitly stored as half before the dependent
+// stages, preserving the reference's fp16 round-trip. RoPE and scale discovery
+// then touch disjoint ranges and run concurrently. This is byte-equivalent to
+// v4b_rmsnorm followed by v4b_rope_trailing and v4c_window_fp8_qat, while
+// removing two tiny dispatches for every transformer layer and generated token.
+[[kernel, max_total_threads_per_threadgroup(kV4CThreads)]]
+kernel void v4c_window_norm_rope_fp8_qat_decode(
+    device half* buf                 [[buffer(0)]],
+    device const float* gamma        [[buffer(1)]],
+    constant float& eps              [[buffer(2)]],
+    constant float& position         [[buffer(3)]],
+    constant float& theta            [[buffer(4)]],
+    constant float& yarn_factor      [[buffer(5)]],
+    constant float& orig_seq_len     [[buffer(6)]],
+    constant float& beta_fast        [[buffer(7)]],
+    constant float& beta_slow        [[buffer(8)]],
+    constant uint& use_yarn          [[buffer(9)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsize [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simdgroups [[simdgroups_per_threadgroup]])
+{
+    constexpr uint width = 512;
+    constexpr uint non_rope = 448;
+    constexpr uint rope_dim = width - non_rope;
+    constexpr uint block = 64;
+    constexpr uint blocks = non_rope / block;
+    threadgroup float scales[blocks];
+    threadgroup float reduce_scratch[32];
+    threadgroup float reduce_broadcast;
+
+    float partial = 0.0f;
+    for (uint i = lid; i < width; i += lsize) {
+        const float value = float(buf[i]);
+        partial = fma(value, value, partial);
+    }
+    const float square_sum = v4c_block_reduce_sum(
+        partial, simd_lane_id, simd_group_id, simdgroups,
+        reduce_scratch, &reduce_broadcast);
+    const float reciprocal_rms = rsqrt(square_sum / float(width) + eps);
+    for (uint i = lid; i < width; i += lsize) {
+        buf[i] = half(float(buf[i]) * reciprocal_rms * gamma[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < rope_dim / 2) {
+        const float freq = v4c_yarn_freq(lid, theta, yarn_factor,
+                                         orig_seq_len, beta_fast, beta_slow,
+                                         rope_dim);
+        const float angle = position * freq;
+        const float cs = cos(angle);
+        const float sn = sin(angle);
+        const uint i0 = non_rope + 2u * lid;
+        const uint i1 = i0 + 1u;
+        const float x0 = float(buf[i0]);
+        const float x1 = float(buf[i1]);
+        buf[i0] = half(x0 * cs - x1 * sn);
+        buf[i1] = half(x0 * sn + x1 * cs);
+    }
+
+    if (lid < blocks) {
+        float amax = 0.0f;
+        for (uint i = 0; i < block; ++i) {
+            amax = max(amax, fabs(float(buf[lid * block + i])));
+        }
+        const float raw_scale = max(amax, 1e-4f) * (1.0f / 448.0f);
+        scales[lid] = v4c_pow2(v4c_log2_ceil_positive(raw_scale));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = lid; d < non_rope; d += kV4CThreads) {
+        const float scale = scales[d / block];
+        const uchar code = v4c_e4m3_encode(float(buf[d]) / scale);
+        buf[d] = half(v4c_e4m3_decode(code) * scale);
+    }
 }
 
 // BF16 embedding row gather broadcast into the fp32 hc-stream residual:
@@ -170,8 +405,8 @@ kernel void v4c_router_weights_at_indices(
 // previous group's first 128 channels and the current group's second 128
 // channels (8 rows), softmax over gate scores + ape, RMSNorm with fp32
 // gamma, group-start partial RoPE on the trailing 64 dims, FP16 out.
-// Hadamard + FP4 QAT sim of the reference write-side is not applied
-// (parity seam; the indexer cache stores FP16).
+// The final WHT + FP4 quantize-dequantize matches the reference write-side;
+// the cache stores the simulated values in FP16.
 kernel void v4c_indexer_compress_group(
     device const float* prev_kv       [[buffer(0)]],   // [4, 256] fp32
     device const float* cur_kv        [[buffer(1)]],   // [4, 256] fp32
@@ -196,6 +431,7 @@ kernel void v4c_indexer_compress_group(
     threadgroup float x[HD];
     threadgroup float reduce_scratch[kV4CThreads / 32];
     threadgroup float bcast;
+    threadgroup float qat_scales[HD / kV4CFP4Block];
 
     const uint d = lid;
 
@@ -216,7 +452,7 @@ kernel void v4c_indexer_compress_group(
         }
         float acc = 0.0f;
         for (uint j = 0; j < 8; ++j) { acc = fma(gate_rows[j], kv_rows[j], acc); }
-        x[d] = acc / sum;
+        x[d] = v4c_bf16_round(acc / sum);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -232,7 +468,8 @@ kernel void v4c_indexer_compress_group(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (d < HD) {
-        x[d] = x[d] * rsqrt(bcast / float(HD) + norm_eps) * gamma[d];
+        x[d] = v4c_bf16_round(
+            x[d] * rsqrt(bcast / float(HD) + norm_eps) * gamma[d]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -252,10 +489,36 @@ kernel void v4c_indexer_compress_group(
         const float sn = sin(angle);
         const float x0 = x[i0];
         const float x1 = x[i1];
-        x[i0] = x0 * cs - x1 * sn;
-        x[i1] = x0 * sn + x1 * cs;
+        x[i0] = v4c_bf16_round(x0 * cs - x1 * sn);
+        x[i1] = v4c_bf16_round(x0 * sn + x1 * cs);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (d < HD) { out[d] = half(x[d]); }
+    constexpr float inv_sqrt_2 = 0.7071067811865475244f;
+    for (uint stride = 1; stride < HD; stride <<= 1) {
+        if (d < HD / 2) {
+            const uint block = d / stride;
+            const uint k = d - block * stride;
+            const uint i0 = block * (stride << 1) + k;
+            const uint i1 = i0 + stride;
+            const float a = x[i0];
+            const float b = x[i1];
+            x[i0] = (a + b) * inv_sqrt_2;
+            x[i1] = (a - b) * inv_sqrt_2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (d < HD / kV4CFP4Block) {
+        float amax = 0.0f;
+        for (uint i = 0; i < kV4CFP4Block; ++i) {
+            amax = max(amax, fabs(x[d * kV4CFP4Block + i]));
+        }
+        const float scaled_max = max(amax, 6.0f * 0x1p-126f) * (1.0f / 6.0f);
+        qat_scales[d] = v4c_pow2(v4c_log2_ceil_positive(scaled_max));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d < HD) {
+        out[d] = half(v4c_fp4_roundtrip(x[d], qat_scales[d / kV4CFP4Block]));
+    }
 }

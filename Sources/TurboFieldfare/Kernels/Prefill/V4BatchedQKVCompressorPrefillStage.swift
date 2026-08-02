@@ -160,6 +160,10 @@ final class V4BatchedQKVCompressorPrefillStage {
                             ropeDim: 64,
                             inverse: false,
                             config: rope)
+        epilogue.encodeWindowKVQAT(commandBuffer: cb,
+                                   buf: outputs.windowKVOut,
+                                   bufOffset: outputs.windowKVOutOffset,
+                                   rows: rowCount)
 
         if let wkv = weights.compressorWKV, let wgate = weights.compressorWGate,
            let wkvOut = outputs.compressorWKVOut, let wgateOut = outputs.compressorWGateOut {
@@ -193,6 +197,10 @@ final class V4BatchedQKVCompressorPrefillStage {
                                 ropeDim: 64,
                                 inverse: false,
                                 config: rope)
+            epilogue.encodeIndexerQAT(commandBuffer: cb,
+                                      buf: indexQOut,
+                                      bufOffset: outputs.indexQOutOffset,
+                                      rows: rowCount * Self.numQHeads)
         }
 
         if let source = indexerPerHeadWeights, let destination = outputs.indexWeightsOut {

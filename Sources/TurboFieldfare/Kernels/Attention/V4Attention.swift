@@ -155,8 +155,8 @@ final class V4Attention {
     ///   RoPE'd; Hadamard + FP4 sim applied write-side per reference).
     /// - `indexKV`: indexer compressed cache ([capacity, 128] FP16).
     /// - `indexWeights`: [64] FP32 per-head weights (pre-scaled).
-    /// - `nVisible`: `cache.visibleGroupCount(layer:windowStart:)` — groups
-    ///   fully below the window start (double-count guard).
+    /// - `nVisible`: `cache.visibleGroupCount(layer:windowStart:)` — every
+    ///   completed compressed group, including intentional window overlap.
     /// - Compressed split buffers + window ring from the cache manager.
     /// - Returns the number of selected sparse entries (for tests).
     @discardableResult

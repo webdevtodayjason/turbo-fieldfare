@@ -78,6 +78,53 @@ import TurboFieldfareValidationSupport
         return x
     }
 
+    private static func hadamardFP4QAT(_ v: [Float], rows: Int, width: Int) -> [Float] {
+        precondition(width == 128)
+        let fp4: [Float] = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+        let invSqrt2 = 1 / Float(2).squareRoot()
+        var out = v
+        for row in 0..<rows {
+            let base = row * width
+            var x = Array(out[base..<(base + width)])
+            var stride = 1
+            while stride < width {
+                var block = 0
+                while block < width {
+                    for k in 0..<stride {
+                        let a = x[block + k]
+                        let b = x[block + k + stride]
+                        x[block + k] = (a + b) * invSqrt2
+                        x[block + k + stride] = (a - b) * invSqrt2
+                    }
+                    block += stride * 2
+                }
+                stride *= 2
+            }
+            for group in 0..<(width / 32) {
+                let lo = group * 32
+                let hi = lo + 32
+                let amax = x[lo..<hi].reduce(Float.zero) { max($0, abs($1)) }
+                let scale = pow(2, ceil(log2(max(amax, 6 * pow(2, -126)) / 6)))
+                for i in lo..<hi {
+                    let q = min(abs(x[i] / scale), 6)
+                    var best = 0
+                    var bestDiff = Float.infinity
+                    for code in 0..<fp4.count {
+                        let diff = abs(fp4[code] - q)
+                        if diff < bestDiff || (diff == bestDiff && code.isMultiple(of: 2)) {
+                            best = code
+                            bestDiff = diff
+                        }
+                    }
+                    let signed = x[i] < 0 ? -fp4[best] : fp4[best]
+                    x[i] = Float(Float16(signed * scale))
+                }
+            }
+            out.replaceSubrange(base..<(base + width), with: x)
+        }
+        return out
+    }
+
     private static func randomFP8(m: Int, n: Int, rng: inout SplitMix64)
         -> V4Quantization.FP8BlockMatrix {
         let codes = (0..<(m * n)).map { _ -> UInt8 in
@@ -171,11 +218,25 @@ import TurboFieldfareValidationSupport
         let relQR = RelError.compute(actual: qrGot, reference: qrRef)
         #expect(relQR < Tolerance.fp16Reduction, "qr rel=\(relQR)")
 
-        // Window KV reference, at the ring slot for position 137.
-        let kvRef = Self.ropeTrailing(
+        // Window KV reference, at the ring slot for position 137. The
+        // checkpoint was trained with in-place FP8 simulation on the 448
+        // non-RoPE channels after norm/RoPE; the final 64 channels remain
+        // FP16 for positional precision.
+        var kvRef = Self.ropeTrailing(
             Self.fp16Round(Self.rmsnorm(
                 Self.fp16Round(V4Quantization.gemvFP8(matrix: wkv, x: x)), gamma: kvGamma)),
             rows: 1, width: Self.headDim, position: Float(Self.position))
+        for block in 0..<(448 / 64) {
+            let base = block * 64
+            let amax = (0..<64).reduce(Float.zero) {
+                max($0, abs(kvRef[base + $1]))
+            }
+            let scale = V4FP8.blockScale(amax: amax)
+            for i in 0..<64 {
+                let quantized = V4FP8.e4m3Encode(kvRef[base + i] / scale)
+                kvRef[base + i] = Float(Float16(V4FP8.e4m3Decode(quantized) * scale))
+            }
+        }
         let ring = slot.buffer.contents().advanced(by: slot.offset)
         let kvGot = (0..<Self.headDim).map {
             Float(ring.load(fromByteOffset: $0 * 2, as: Float16.self))
@@ -196,13 +257,21 @@ import TurboFieldfareValidationSupport
             #expect(rel < Tolerance.fp16Reduction, "compressor \(name) rel=\(rel)")
         }
 
-        // Indexer q from the shared qr, trailing RoPE, NO weight-free renorm.
-        let idxRef = Self.ropeTrailing(
+        // Indexer q from the shared qr, trailing RoPE, normalized Hadamard,
+        // then block-32 e2m1/e8m0 quantize-dequantize per the QAT reference.
+        let idxRef = Self.hadamardFP4QAT(Self.fp16Round(Self.ropeTrailing(
             Self.fp16Round(V4Quantization.gemvFP8(matrix: widx, x: qrRef)),
-            rows: Self.heads, width: Self.indexDim, position: Float(Self.position))
+            rows: Self.heads, width: Self.indexDim, position: Float(Self.position))),
+            rows: Self.heads, width: Self.indexDim)
         let idxGot = Fp16Buffer.read(idxOut, count: Self.heads * Self.indexDim)
         let relIdx = RelError.compute(actual: idxGot, reference: idxRef)
-        #expect(relIdx < Tolerance.fp16ChainedReduction, "indexer q rel=\(relIdx)")
+        let diffs = zip(idxGot, idxRef).enumerated().filter { abs($0.element.0 - $0.element.1) > 0 }
+        // WHT reassociation can move an exact FP4 midpoint to either adjacent
+        // ties-to-even bucket. The transform must otherwise be bit-exact and
+        // midpoint differences must remain one legal FP4 step.
+        #expect(diffs.count <= 4, "indexer q mismatches=\(diffs.count)")
+        #expect(diffs.allSatisfy { abs($0.element.0 - $0.element.1) <= 128 })
+        #expect(relIdx <= 0.0625, "indexer q rel=\(relIdx)")
     }
 
     /// The weight-free per-head renorm must actually run: a q whose heads

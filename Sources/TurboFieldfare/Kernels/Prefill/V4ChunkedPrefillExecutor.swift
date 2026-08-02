@@ -101,7 +101,7 @@ final class V4ChunkedPrefillExecutor {
             if kind != .passthrough && cache.completesGroup(layer: layer, tokenPosition: pos) { flush(cb, layer, kind, pos, compressorWeights!, rope, normEps) }
             let tokenCount = pos + 1
             let nVisible = cache.visibleGroupCount(layer: layer, windowStart: max(0, tokenCount - config.window), tokenCount: tokenCount)
-            cache.assertDisjointCoverage(layer: layer, groupCount: nVisible, tokenCount: tokenCount)
+            cache.assertVisibleGroupsCompleted(layer: layer, groupCount: nVisible, tokenCount: tokenCount)
             decode(cb, layer, kind, tokenCount, nVisible, row, inputs)
         }
     }

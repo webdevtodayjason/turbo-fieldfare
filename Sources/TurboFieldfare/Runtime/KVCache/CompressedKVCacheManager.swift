@@ -29,10 +29,10 @@ import Metal
 /// - HCA (ratio 128): entry `g` emitted when token `128g+127` is appended;
 ///   non-overlapped; RoPE phase of position `128g`.
 ///
-/// Coverage invariant (the double-count guard from the work-order risk
-/// table): the attention kernel must only select compressed entries whose
-/// whole group lies *below* the window start. `visibleGroupCount` exposes
-/// exactly that bound; `assertDisjointCoverage` checks it in debug builds.
+/// Attention visibility matches the official `get_compress_topk_idxs` rule:
+/// every completed compressed group is selectable. Compressed entries may
+/// intentionally overlap the 128-token window; that composition is part of
+/// the trained model and must not be filtered as duplicate coverage.
 public final class CompressedKVCacheManager {
     public let config: V4CacheConfig
     public let maxContext: Int
@@ -284,13 +284,12 @@ public final class CompressedKVCacheManager {
                        offset: group * V4KVLayout.ropeStride(config: config)))
     }
 
-    // MARK: - Coverage disjointness (double-count guard)
+    // MARK: - Attention visibility
 
-    /// Number of leading compressed groups whose entire coverage lies below
-    /// `windowStart`. The sparse/dense attention over compressed entries
-    /// must select only from `[0, visibleGroupCount)` so no logical
-    /// position is attended twice (once compressed, once through the
-    /// window branch).
+    /// Number of completed compressed groups selectable by attention.
+    /// `windowStart` is retained in the API because callers already compute
+    /// it for the window branch, but the reference intentionally permits the
+    /// compressed groups to overlap that branch.
     public func visibleGroupCount(layer: Int, windowStart: Int) -> Int {
         visibleGroupCount(layer: layer, windowStart: windowStart,
                           tokenCount: position)
@@ -300,23 +299,16 @@ public final class CompressedKVCacheManager {
     /// decode position.
     public func visibleGroupCount(layer: Int, windowStart: Int,
                                   tokenCount: Int) -> Int {
-        let ratio = config.compressRatio(layer: layer)
-        guard ratio > 0, windowStart > 0 else { return 0 }
-        return min(windowStart / ratio,
-                   completedGroupCount(layer: layer, tokenCount: tokenCount))
+        _ = windowStart
+        return completedGroupCount(layer: layer, tokenCount: tokenCount)
     }
 
-    /// Debug-build assertion that the first `groupCount` compressed groups
-    /// and the window range cover disjoint logical positions.
-    public func assertDisjointCoverage(layer: Int,
-                                       groupCount: Int,
-                                       tokenCount: Int) {
-        let window = windowRange(tokenCount: tokenCount)
-        guard groupCount > 0, !window.isEmpty else { return }
-        let lastCovered = groupCoverage(layer: layer, group: groupCount - 1).upperBound
-        assert(lastCovered <= window.lowerBound,
-               "compressed group \(groupCount - 1) covers up to \(lastCovered) "
-               + "but window starts at \(window.lowerBound): double-count")
+    /// Debug-build guard that attention never reads an uncompleted group.
+    public func assertVisibleGroupsCompleted(layer: Int,
+                                             groupCount: Int,
+                                             tokenCount: Int) {
+        assert(groupCount <= completedGroupCount(layer: layer, tokenCount: tokenCount),
+               "visible compressed group count exceeds completed groups")
     }
 
     // MARK: - Indexer store (CSA layers)

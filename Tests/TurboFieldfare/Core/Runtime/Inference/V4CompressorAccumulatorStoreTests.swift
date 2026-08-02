@@ -3,16 +3,20 @@ import Metal
 @testable import TurboFieldfare
 
 @Suite struct V4CompressorAccumulatorStoreTests {
-    @Test func accumulatorBuffersStartZeroed() throws {
+    @Test func accumulatorBuffersMatchReferenceInitialState() throws {
         let ctx = try MetalContext()
         let store = try V4CompressorAccumulatorStore(device: ctx.device,
                                                      layerKinds: [.csa, .hca])
 
         let csa = store.csa(layer: 0)
         #expect(Self.read(csa.prevKV, offset: 0) == 0)
-        #expect(Self.read(csa.prevGate, offset: 0) == 0)
+        #expect(Self.read(csa.prevGate, offset: 0) == -.infinity)
         #expect(Self.read(csa.idxPrevKV, offset: 0) == 0)
-        #expect(Self.read(csa.idxPrevGate, offset: 0) == 0)
+        #expect(Self.read(csa.idxPrevGate, offset: 0) == -.infinity)
+        #expect(Self.read(csa.prevGate,
+                          offset: V4CompressorAccumulatorStore.csaRows * V4CompressorAccumulatorStore.csaWidth - 1) == -.infinity)
+        #expect(Self.read(csa.idxPrevGate,
+                          offset: V4CompressorAccumulatorStore.csaRows * V4CompressorAccumulatorStore.csaIndexerWidth - 1) == -.infinity)
         #expect(Self.read(csa.curKV, offset: V4CompressorAccumulatorStore.csaRows * V4CompressorAccumulatorStore.csaWidth - 1) == 0)
         #expect(Self.read(csa.idxCurGate, offset: V4CompressorAccumulatorStore.csaRows * V4CompressorAccumulatorStore.csaIndexerWidth - 1) == 0)
 

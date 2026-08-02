@@ -17,6 +17,12 @@ import TurboFieldfareValidationSupport
 
     // MARK: - CPU references
 
+    private static func bf16Round(_ value: Float) -> Float {
+        var bits = value.bitPattern
+        bits &+= 0x7FFF &+ ((bits >> 16) & 1)
+        return Float(bitPattern: bits & 0xFFFF_0000)
+    }
+
     /// score[b] = sum_h w[h] * relu(q[h] . kv[b]) — ReLU-then-weighted-sum.
     private static func refIndexScores(q: [Float], kv: [Float],
                                        weights: [Float], nBlocks: Int) -> [Float] {
@@ -91,11 +97,13 @@ import TurboFieldfareValidationSupport
             for j in 0..<8 { gate[j] = exp(gate[j] - mx); sum += gate[j] }
             var acc: Float = 0
             for j in 0..<8 { acc += gate[j] * kv[j] }
-            x[d] = acc / sum
+            // Reference Compressor.forward casts pooled values back to the
+            // hidden activation dtype (BF16) before RMSNorm.
+            x[d] = bf16Round(acc / sum)
         }
         let ms = x.reduce(0) { $0 + $1 * $1 } / Float(headDim)
         let inv = 1 / (ms + 1e-6).squareRoot()
-        for d in 0..<headDim { x[d] = x[d] * inv * gamma[d] }
+        for d in 0..<headDim { x[d] = bf16Round(x[d] * inv * gamma[d]) }
         // Partial RoPE on the trailing 64 dims, interleaved (adjacent-pair)
         // convention matching the official reference: slice pair i covers
         // elements (448+2i, 448+2i+1), rotated at the group-start position
@@ -104,10 +112,47 @@ import TurboFieldfareValidationSupport
             let angle = Float(ropePosition) * yarnFreq(i)
             let cs = cos(angle), sn = sin(angle)
             let x0 = x[448 + 2 * i], x1 = x[448 + 2 * i + 1]
-            x[448 + 2 * i] = x0 * cs - x1 * sn
-            x[448 + 2 * i + 1] = x0 * sn + x1 * cs
+            x[448 + 2 * i] = bf16Round(x0 * cs - x1 * sn)
+            x[448 + 2 * i + 1] = bf16Round(x0 * sn + x1 * cs)
         }
         return x
+    }
+
+    private static func refIndexerCompressGroup(prevKV: [Float], curKV: [Float],
+                                                prevGate: [Float], curGate: [Float],
+                                                ape: [Float], gamma: [Float],
+                                                ropePosition: Int) -> [Float] {
+        var x = [Float](repeating: 0, count: indexDim)
+        for d in 0..<indexDim {
+            var kv = [Float](repeating: 0, count: 8)
+            var gate = [Float](repeating: 0, count: 8)
+            for j in 0..<4 {
+                kv[j] = prevKV[j * 256 + d]
+                gate[j] = prevGate[j * 256 + d] + ape[j * 256 + d]
+                kv[4 + j] = curKV[j * 256 + indexDim + d]
+                gate[4 + j] = curGate[j * 256 + indexDim + d] + ape[j * 256 + indexDim + d]
+            }
+            let mx = gate.max()!
+            var sum: Float = 0
+            for j in 0..<8 { gate[j] = exp(gate[j] - mx); sum += gate[j] }
+            var acc: Float = 0
+            for j in 0..<8 { acc += gate[j] * kv[j] }
+            x[d] = bf16Round(acc / sum)
+        }
+        let ms = x.reduce(0) { $0 + $1 * $1 } / Float(indexDim)
+        let inv = 1 / (ms + 1e-6).squareRoot()
+        for d in 0..<indexDim { x[d] = bf16Round(x[d] * inv * gamma[d]) }
+        for i in 0..<32 {
+            let angle = Float(ropePosition) * yarnFreq(i)
+            let cs = cos(angle), sn = sin(angle)
+            let x0 = x[64 + 2 * i], x1 = x[64 + 2 * i + 1]
+            x[64 + 2 * i] = bf16Round(x0 * cs - x1 * sn)
+            x[64 + 2 * i + 1] = bf16Round(x0 * sn + x1 * cs)
+        }
+        let rotated = WhtRef.apply(x)
+        let quantized = V4Quantization.quantizeFP4Row(rotated)
+        return V4Quantization.dequantizeFP4Row(quantized, n: indexDim)
+            .map { Float(Float16($0)) }
     }
 
     // MARK: - Indexer score kernel
@@ -306,6 +351,49 @@ import TurboFieldfareValidationSupport
         #expect(rel < 8e-2, "compressed entry rel=\(rel)")
     }
 
+    @Test func indexerCompressGroup_matchesHadamardFP4Reference() throws {
+        let ctx = try MetalContext()
+        let glue = try V4DecodeGlue(context: ctx)
+        var rng = SeedTree(0xF6D).key("indexer-compressor-qat")
+        let prevKV = (0..<(4 * 256)).map { _ in rng.uniform(-1, 1) }
+        let curKV = (0..<(4 * 256)).map { _ in rng.uniform(-1, 1) }
+        let prevGate = (0..<(4 * 256)).map { _ in rng.uniform(-1, 1) }
+        let curGate = (0..<(4 * 256)).map { _ in rng.uniform(-1, 1) }
+        let ape = (0..<(4 * 256)).map { _ in rng.uniform(-0.25, 0.25) }
+        let gamma = (0..<Self.indexDim).map { _ in rng.uniform(0.5, 1.5) }
+
+        func f32buf(_ values: [Float]) -> MTLBuffer? {
+            ctx.device.makeBuffer(bytes: values, length: values.count * 4,
+                                  options: .storageModeShared)
+        }
+        guard let pk = f32buf(prevKV), let ck = f32buf(curKV),
+              let pg = f32buf(prevGate), let cg = f32buf(curGate),
+              let ab = f32buf(ape), let gb = f32buf(gamma),
+              let out = Fp16Buffer.make(ctx.device, count: Self.indexDim) else {
+            Issue.record("alloc failed"); return
+        }
+        let ropePosition = 28
+        let cb = ctx.queue.makeCommandBuffer()!
+        glue.encodeIndexerCompressGroup(commandBuffer: cb,
+                                        prevKV: pk, curKV: ck,
+                                        prevGate: pg, curGate: cg,
+                                        ape: ab, gamma: gb,
+                                        out: out,
+                                        ropePosition: UInt32(ropePosition),
+                                        rope: .compressedLayer,
+                                        normEps: 1e-6)
+        cb.commit(); cb.waitUntilCompleted()
+
+        let actual = Fp16Buffer.read(out, count: Self.indexDim)
+        let reference = Self.refIndexerCompressGroup(
+            prevKV: prevKV, curKV: curKV,
+            prevGate: prevGate, curGate: curGate,
+            ape: ape, gamma: gamma, ropePosition: ropePosition)
+        let diffs = zip(actual, reference).filter { $0.0 != $0.1 }
+        #expect(diffs.count <= 2, "indexer compressor mismatches=\(diffs.count)")
+        #expect(RelError.compute(actual: actual, reference: reference) <= 0.0625)
+    }
+
     // MARK: - CSA end-to-end
 
     @Test func csaDecode_endToEnd_matchesCPUReferenceChain() throws {
@@ -317,13 +405,14 @@ import TurboFieldfareValidationSupport
         let attn = try V4Attention(device: ctx.device, maxContext: maxContext)
 
         var rng = SeedTree(0xF6C).key("csa-e2e")
-        // tokenCount 4000: window [3872, 4000), completed 1000 groups,
-        // visible = 3872/4 = 968 > 512: the top-k genuinely truncates.
+        // tokenCount 4000: 1000 groups are completed. The official reference
+        // keeps all completed groups selectable even though the newest 32
+        // groups overlap the 128-token window, so top-k genuinely truncates.
         let tokenCount = 4000
         let windowStart = kv.windowRange(tokenCount: tokenCount).lowerBound
         let nVisible = kv.visibleGroupCount(layer: 0, windowStart: windowStart,
                                             tokenCount: tokenCount)
-        #expect(nVisible == 968)
+        #expect(nVisible == 1000)
 
         var entries: [[Float]] = []
         for g in 0..<nVisible {

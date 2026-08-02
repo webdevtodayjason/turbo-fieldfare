@@ -14,6 +14,12 @@ import TurboFieldfareValidationSupport
 
     // MARK: - CPU reference
 
+    private static func bf16Round(_ value: Float) -> Float {
+        var bits = value.bitPattern
+        bits &+= 0x7FFF &+ ((bits >> 16) & 1)
+        return Float(bitPattern: bits & 0xFFFF_0000)
+    }
+
     private static func yarnFreq(_ i: Int,
                                  theta: Float = 160_000,
                                  factor: Float = 16,
@@ -49,17 +55,17 @@ import TurboFieldfareValidationSupport
                 sum += w
                 acc += w * kv[j * headDim + d]
             }
-            x[d] = acc / sum
+            x[d] = bf16Round(acc / sum)
         }
         let ms = x.reduce(0) { $0 + $1 * $1 } / Float(headDim)
         let inv = 1 / (ms + 1e-6).squareRoot()
-        for d in 0..<headDim { x[d] = x[d] * inv * gamma[d] }
+        for d in 0..<headDim { x[d] = bf16Round(x[d] * inv * gamma[d]) }
         for i in 0..<32 {
             let angle = Float(ropePosition) * yarnFreq(i)
             let cs = cos(angle), sn = sin(angle)
             let x0 = x[448 + 2 * i], x1 = x[448 + 2 * i + 1]
-            x[448 + 2 * i] = x0 * cs - x1 * sn
-            x[448 + 2 * i + 1] = x0 * sn + x1 * cs
+            x[448 + 2 * i] = bf16Round(x0 * cs - x1 * sn)
+            x[448 + 2 * i + 1] = bf16Round(x0 * sn + x1 * cs)
         }
         return x
     }

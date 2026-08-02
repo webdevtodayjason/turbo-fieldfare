@@ -34,13 +34,19 @@ public final class V4CompressorAccumulatorStore {
     private let hcaByLayer: [Int: HCAState]
 
     public init(device: MTLDevice, layerKinds: [V4LayerKind]) throws {
-        func scratch(_ floats: Int, _ label: String) throws -> MTLBuffer {
+        func scratch(_ floats: Int, _ label: String,
+                     initialValue: Float = 0) throws -> MTLBuffer {
             guard let buffer = device.makeBuffer(length: floats * MemoryLayout<Float>.stride,
                                                  options: .storageModeShared) else {
                 throw MetalError.missingFunction("v4 compressor accumulator: \(label)")
             }
             buffer.label = label
-            memset(buffer.contents(), 0, buffer.length)
+            if initialValue == 0 {
+                memset(buffer.contents(), 0, buffer.length)
+            } else {
+                let values = buffer.contents().assumingMemoryBound(to: Float.self)
+                values.initialize(repeating: initialValue, count: floats)
+            }
             return buffer
         }
 
@@ -52,11 +58,15 @@ public final class V4CompressorAccumulatorStore {
                 csa[layer] = CSAState(
                     prevKV: try scratch(Self.csaRows * Self.csaWidth, "layer\(layer).csaPrevKV"),
                     curKV: try scratch(Self.csaRows * Self.csaWidth, "layer\(layer).csaCurKV"),
-                    prevGate: try scratch(Self.csaRows * Self.csaWidth, "layer\(layer).csaPrevGate"),
+                    prevGate: try scratch(Self.csaRows * Self.csaWidth,
+                                          "layer\(layer).csaPrevGate",
+                                          initialValue: -.infinity),
                     curGate: try scratch(Self.csaRows * Self.csaWidth, "layer\(layer).csaCurGate"),
                     idxPrevKV: try scratch(Self.csaRows * Self.csaIndexerWidth, "layer\(layer).idxPrevKV"),
                     idxCurKV: try scratch(Self.csaRows * Self.csaIndexerWidth, "layer\(layer).idxCurKV"),
-                    idxPrevGate: try scratch(Self.csaRows * Self.csaIndexerWidth, "layer\(layer).idxPrevGate"),
+                    idxPrevGate: try scratch(Self.csaRows * Self.csaIndexerWidth,
+                                             "layer\(layer).idxPrevGate",
+                                             initialValue: -.infinity),
                     idxCurGate: try scratch(Self.csaRows * Self.csaIndexerWidth, "layer\(layer).idxCurGate"))
             case .hca:
                 hca[layer] = HCAState(

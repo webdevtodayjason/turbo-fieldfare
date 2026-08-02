@@ -103,6 +103,12 @@ inline float v4_ue8m0_decode(uchar b) {
     return exp2(float(int(b) - 127));
 }
 
+inline float v4_bf16_round(float value) {
+    uint bits = as_type<uint>(value);
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    return as_type<float>(bits & 0xFFFF0000u);
+}
+
 /// DeepSeek YaRN-adjusted frequency for rope pair `pair` (of 32, rope dim
 /// 64), matching the reference precompute_freqs_cis: correction range from
 /// beta_fast/beta_slow against original_seq_len, linear ramp, blend of
@@ -496,13 +502,15 @@ void v4_csa_compress_group(
     }
     float acc = 0.0f;
     for (uint j = 0; j < 8; ++j) { acc = fma(gate_rows[j], kv_rows[j], acc); }
-    acc /= sum;
+    // Reference Compressor.forward casts the pooled row back to the hidden
+    // activation dtype (BF16) before RMSNorm.
+    acc = v4_bf16_round(acc / sum);
 
     // RMSNorm over the 512 channels.
     const float sq = v4_block_reduce_sum(acc * acc, simd_lane_id,
                                          simd_group_id, simdgroups,
                                          reduce_scratch, &bcast);
-    x[d] = acc * rsqrt(sq / float(HD) + norm_eps) * gamma[d];
+    x[d] = v4_bf16_round(acc * rsqrt(sq / float(HD) + norm_eps) * gamma[d]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Partial RoPE on the trailing 64 dims, interleaved (adjacent-pair)
@@ -521,8 +529,8 @@ void v4_csa_compress_group(
         const float sn = sin(angle);
         const float x0 = x[i0];
         const float x1 = x[i1];
-        x[i0] = x0 * cs - x1 * sn;
-        x[i1] = x0 * sn + x1 * cs;
+        x[i0] = v4_bf16_round(x0 * cs - x1 * sn);
+        x[i1] = v4_bf16_round(x0 * sn + x1 * cs);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

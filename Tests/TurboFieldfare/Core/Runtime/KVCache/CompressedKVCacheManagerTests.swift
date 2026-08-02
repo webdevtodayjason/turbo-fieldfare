@@ -5,7 +5,7 @@ import Metal
 import TurboFieldfareValidationSupport
 
 /// V4F-03 milestone 1: CompressedKVCacheManager capacity math, group
-/// bookkeeping, coverage disjointness, FP8-split round-trip, and reset
+/// bookkeeping, reference visibility, FP8-split round-trip, and reset
 /// semantics on synthetic data. No model process required.
 @Suite struct CompressedKVCacheManagerTests {
 
@@ -115,18 +115,21 @@ import TurboFieldfareValidationSupport
         #expect(kv.ropePosition(layer: 3, group: 1) == 128)
     }
 
-    @Test func visibleGroupCount_excludesGroupsTouchingTheWindow() throws {
+    @Test func visibleGroupCount_matchesReferenceCompletedGroups() throws {
         let (_, kv) = try makeManager(maxContext: 512)
-        // tokenCount 300: window covers [172, 300). CSA groups are 4 wide;
-        // group g covers [4g, 4g+4); fully below 172 iff 4g+4 <= 172, so
-        // g <= 42 -> 43 visible groups (of 75 completed).
-        #expect(kv.visibleGroupCount(layer: 2, windowStart: 172, tokenCount: 300) == 43)
-        // HCA: 128-wide groups; only group 0 ([0,128)) lies fully below 172.
-        #expect(kv.visibleGroupCount(layer: 3, windowStart: 172, tokenCount: 300) == 1)
-        #expect(kv.visibleGroupCount(layer: 2, windowStart: 0, tokenCount: 300) == 0)
+        // Official get_compress_topk_idxs exposes every completed group via
+        // floor(tokenCount / ratio), even when its represented tokens overlap
+        // the 128-token window. That overlap is part of the trained attention
+        // composition, not a double-counting error to suppress.
+        #expect(kv.visibleGroupCount(layer: 2, windowStart: 172, tokenCount: 300) == 75)
+        #expect(kv.visibleGroupCount(layer: 3, windowStart: 172, tokenCount: 300) == 2)
+        #expect(kv.visibleGroupCount(layer: 2, windowStart: 0, tokenCount: 300) == 75)
+        // Regression: at token 165 the final window starts at 37, but HCA
+        // group 0 must still be visible or tokens 0..<37 disappear entirely.
+        #expect(kv.visibleGroupCount(layer: 3, windowStart: 37, tokenCount: 165) == 1)
     }
 
-    @Test func coverageDisjointness_holdsAcrossPositions() throws {
+    @Test func visibleGroups_neverExceedCompletedGroups() throws {
         let (_, kv) = try makeManager(maxContext: 512)
         var rng = SeedTree(0xA11).key("coverage")
         for _ in 0..<50 {
@@ -134,20 +137,8 @@ import TurboFieldfareValidationSupport
             let windowStart = kv.windowRange(tokenCount: tokenCount).lowerBound
             let visible = kv.visibleGroupCount(layer: 2, windowStart: windowStart,
                                                tokenCount: tokenCount)
-            // The asserted invariant: last visible group's coverage ends at
-            // or before the window start (no position attended twice).
-            kv.assertDisjointCoverage(layer: 2, groupCount: visible,
-                                      tokenCount: tokenCount)
-            if visible > 0 {
-                let last = kv.groupCoverage(layer: 2, group: visible - 1)
-                #expect(last.upperBound <= windowStart)
-            }
-            // And the next group (if completed) always reaches into the window.
             let completed = kv.completedGroupCount(layer: 2, tokenCount: tokenCount)
-            if visible < completed {
-                let next = kv.groupCoverage(layer: 2, group: visible)
-                #expect(next.upperBound > windowStart)
-            }
+            #expect(visible == completed)
         }
     }
 

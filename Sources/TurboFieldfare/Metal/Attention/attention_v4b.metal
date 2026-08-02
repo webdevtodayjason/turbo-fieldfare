@@ -1,6 +1,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float v4b_bf16_round(float value) {
+    uint bits = as_type<uint>(value);
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    return as_type<float>(bits & 0xFFFF0000u);
+}
+
 // ============================================================================
 // attention_v4b — DeepSeek V4-Flash decode-side boundary kernels (V4F-03,
 // second wave). Separate module from attention_v4.metal so the committed
@@ -419,13 +425,13 @@ void v4b_hca_compress_group(
         sum += w;
         acc = fma(w, kv[j * HD + d], acc);
     }
-    acc /= sum;
+    acc = v4b_bf16_round(acc / sum);
 
     // RMSNorm over the 512 channels.
     const float sq = v4b_block_reduce_sum(acc * acc, simd_lane_id,
                                           simd_group_id, simdgroups,
                                           reduce_scratch, &bcast);
-    x[d] = acc * rsqrt(sq / float(HD) + norm_eps) * gamma[d];
+    x[d] = v4b_bf16_round(acc * rsqrt(sq / float(HD) + norm_eps) * gamma[d]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Partial RoPE on the trailing 64 dims at the group-start position.
@@ -442,8 +448,8 @@ void v4b_hca_compress_group(
         const float sn = sin(angle);
         const float x0 = x[i0];
         const float x1 = x[i1];
-        x[i0] = x0 * cs - x1 * sn;
-        x[i1] = x0 * sn + x1 * cs;
+        x[i0] = v4b_bf16_round(x0 * cs - x1 * sn);
+        x[i1] = v4b_bf16_round(x0 * sn + x1 * cs);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

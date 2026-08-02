@@ -52,11 +52,35 @@ with adversarial names: `foo.layersx.1`, `layers.0.attn`,
 > structure instead and adds adversarial-name tests. No behavior change
 > for the pinned Gemma checkpoint (all its names parse identically).
 
-## 2. Multi-model-family support (future RFC, NOT a PR first)
+## 2. Experimental DeepSeek V4-Flash support (issue or draft PR)
 
-The V4-Flash port (branch `v4f`) is the evidence base. Open an issue
-before any PR series; the arch gate is the maintainer's pinned
-contract. Candidate slice order if accepted: safetensors dtype
-extension -> dual-family quant parsing -> per-expert planner fork ->
-kernel pack -> runtime family branch. Do not send before V4F-05
-holdout evidence exists (per the community benchmark protocol).
+**Status:** validated experimentally on branch `v4f`; see
+[`V4F_VALIDATION.md`](V4F_VALIDATION.md). The 145 GB repacked model loads and
+generates coherently on a 128 GB M5 Max. Clean greedy short-context decode
+measured 5.755 tok/s over 48 new tokens and 6.022 tok/s over 24. The complete
+V4 filter passes 162 tests across 23 suites, including real-checkpoint kernel
+goldens.
+
+**Claim boundary:** compressed-memory long-context retrieval is not fully
+supported. A natural 231-token retrieval prompt returns the correct answer
+immediately, but a synthetic 2,353-token prompt reproducibly returns the wrong
+season. Present this as an experimental second model family, with the failing
+fixture and result included rather than hidden.
+
+Recommended first contact is an issue or draft PR because the arch gate is a
+maintainer-owned pinned contract. Candidate review slices remain: safetensors
+dtype extension -> dual-family quant parsing -> per-expert planner fork ->
+kernel pack -> runtime family branch. If maintainers prefer a narrower first
+change, extract the `layerIndex` robustness fix above before proposing the full
+series.
+
+**PR summary draft:**
+
+> Adds experimental DeepSeek V4-Flash support on Apple Silicon. The 145 GB
+> repacked model loads and generates coherently on a 128 GB Mac. On the tested
+> M5 Max, clean greedy short-context decode measured approximately 5.8-6.0
+> tok/s. Focused GPU correctness tests and short-context generation pass.
+> Compressed-memory long-context retrieval remains experimental: natural
+> retrieval succeeds at 231 tokens, while a reproducible synthetic retrieval
+> test fails at 2,353 tokens. Long-context inference is not represented as
+> fully supported.

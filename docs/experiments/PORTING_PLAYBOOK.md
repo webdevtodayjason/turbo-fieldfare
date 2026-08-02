@@ -417,6 +417,29 @@ Recorded top risks, in order:
 4. **MoE plumbing generalization:** `MoE.swift` hardcodes topK=8 and a
    9-field `MoEExpertOffsets`; V4 needs 6 slots, 6 fields, no biases.
 
+Final reference-alignment and submission gate (2026-08-02):
+
+- Completed compressed groups are now all visible to attention, matching the
+  official overlap semantics rather than enforcing window/compressed
+  disjointness.
+- CSA previous gate state initializes to `-infinity`; CSA/HCA compressor output
+  observes the reference BF16 round-trip points.
+- Lightning-indexer query/cache values now run the normalized WHT + FP4 QAT
+  simulation, and window KV runs block-64 FP8 activation QAT on the first 448
+  channels.
+- The decode window RMSNorm + trailing RoPE + FP8 QAT stages are fused without
+  removing the FP16 storage boundary. This recovered a correctness-first
+  24-token measurement from 4.109 to 6.022 tok/s.
+- Final focused gate: 162 V4 tests across 23 suites pass, including real-byte
+  checkpoint goldens. Clean 48-token short decode measured 5.755 tok/s.
+- Natural retrieval at 231 prompt tokens returns `autumn` immediately. A
+  synthetic 2,353-token fixture reproducibly returns `spring` even though
+  `autumn` is the only season answer in the prompt. Instrumentation confirms
+  early compressed groups are selected, so top-k visibility is not the cause.
+  Long-context compressed-memory support remains experimental.
+- Complete commands, outputs, host details, and claim boundaries are recorded in
+  [`V4F_VALIDATION.md`](V4F_VALIDATION.md).
+
 ### V4F-05: Holdout validation
 
 - **Hypothesis:** Baseline results generalize beyond the tuning prompts.

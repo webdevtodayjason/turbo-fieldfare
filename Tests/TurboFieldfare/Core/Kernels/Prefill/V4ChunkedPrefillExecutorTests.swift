@@ -165,7 +165,7 @@ import TurboFieldfareValidationSupport
         #expect(cache.position == rows)
     }
 
-    @Test func csaGroupCompletionCarryAndDisjointness() throws {
+    @Test func csaGroupCompletionCarriesAndExposesCompletedGroups() throws {
         let (ctx, cache, exec) = try objects(V4CacheConfig(compressRatios: [4]), maxContext: 256)
         let c = compressedInputs(ctx.device, rows: 8, kind: .csa)
         let cb = ctx.queue.makeCommandBuffer()!
@@ -173,8 +173,7 @@ import TurboFieldfareValidationSupport
         cb.commit(); cb.waitUntilCompleted()
         #expect(cb.status == .completed); #expect(cache.position == 0)
         #expect(cache.completedGroupCount(layer: 0, tokenCount: 8) == 2)
-        #expect(cache.visibleGroupCount(layer: 0, windowStart: 4, tokenCount: 8) == 1)
-        cache.assertDisjointCoverage(layer: 0, groupCount: 0, tokenCount: 8)
+        #expect(cache.visibleGroupCount(layer: 0, windowStart: 4, tokenCount: 8) == 2)
     }
 
     @Test func hcaGroupCompletionFlushesOneEntry() throws {

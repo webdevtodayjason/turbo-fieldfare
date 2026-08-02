@@ -21,9 +21,8 @@ import Metal
 /// use out-dim 1024, HCA 512.
 ///
 /// **Indexer feed** (optional, CSA only): `index_q = wq_b_index(qr)` FP8
-/// [64*128, 1024] with trailing-slice RoPE. The reference's Hadamard + FP4
-/// QAT sim is NOT applied here (write-side concern of the indexer store;
-/// recorded as a gap in the V4F-03 report).
+/// [64*128, 1024] with trailing-slice RoPE, normalized Hadamard rotation,
+/// and block-32 FP4 QAT quantize-dequantize.
 final class V4QKVEpilogue {
     static let dim = 4096
     static let qLoraRank = 1024
@@ -75,6 +74,9 @@ final class V4QKVEpilogue {
     private let renormPSO: MTLComputePipelineState
     private let ropePSO: MTLComputePipelineState
     private let gemvF32PSO: MTLComputePipelineState
+    private let indexerQATPSO: MTLComputePipelineState
+    private let windowQATPSO: MTLComputePipelineState
+    private let windowRoPEQATPSO: MTLComputePipelineState
 
     /// Latent scratch: RMS-normalized qr [1024] fp16 (also feeds the
     /// indexer up-projection, per the shared-`qr` reference structure).
@@ -102,6 +104,19 @@ final class V4QKVEpilogue {
                                                module: "attention_v4b",
                                                subdirectory: "Metal/Attention",
                                                name: "v4b_gemv_f32")
+        self.indexerQATPSO = try library.pipeline(device: device,
+                                                 module: "attention_v4c",
+                                                 subdirectory: "Metal/Attention",
+                                                 name: "v4c_indexer_hadamard_fp4_qat")
+        self.windowQATPSO = try library.pipeline(device: device,
+                                                module: "attention_v4c",
+                                                subdirectory: "Metal/Attention",
+                                                name: "v4c_window_fp8_qat")
+        self.windowRoPEQATPSO = try library.pipeline(
+            device: device,
+            module: "attention_v4c",
+            subdirectory: "Metal/Attention",
+            name: "v4c_window_norm_rope_fp8_qat_decode")
         guard let qr = device.makeBuffer(
             length: Self.qLoraRank * MemoryLayout<Float16>.size,
             options: .storageModeShared) else {
@@ -168,15 +183,12 @@ final class V4QKVEpilogue {
                           x: x, xOffset: xOffset,
                           y: slot.buffer, yOffset: slot.offset,
                           m: Self.headDim, n: Self.dim)
-            encodeRMSNorm(commandBuffer: cb,
-                          buf: slot.buffer, bufOffset: slot.offset,
-                          gamma: weights.kvNormGamma,
-                          gammaOffset: weights.kvNormGammaOffset,
-                          n: Self.headDim, eps: normEps, useGamma: true)
-            encodeRoPE(commandBuffer: cb,
-                       buf: slot.buffer, bufOffset: slot.offset,
-                       rows: 1, width: Self.headDim,
-                       position: Float(position), inverse: false, config: rope)
+            encodeWindowRoPEQAT(commandBuffer: cb,
+                                buf: slot.buffer, bufOffset: slot.offset,
+                                gamma: weights.kvNormGamma,
+                                gammaOffset: weights.kvNormGammaOffset,
+                                eps: normEps,
+                                position: Float(position), config: rope)
         }
 
         // Compressor feed (fp32 projections).
@@ -211,6 +223,8 @@ final class V4QKVEpilogue {
                        buf: indexQOut, bufOffset: 0,
                        rows: Self.numQHeads, width: Self.indexHeadDim,
                        position: Float(position), inverse: false, config: rope)
+            encodeIndexerQAT(commandBuffer: cb, buf: indexQOut,
+                             rows: Self.numQHeads)
         }
     }
 
@@ -272,6 +286,66 @@ final class V4QKVEpilogue {
         enc.setBytes(&e, length: 4, index: 2)
         enc.dispatchThreadgroups(MTLSize(width: heads, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    func encodeIndexerQAT(commandBuffer cb: MTLCommandBuffer,
+                          buf: MTLBuffer, bufOffset: Int = 0,
+                          rows: Int) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(indexerQATPSO)
+        enc.setBuffer(buf, offset: bufOffset, index: 0)
+        var rowCount = UInt32(rows)
+        enc.setBytes(&rowCount, length: 4, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: Self.indexHeadDim,
+                                                                height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    func encodeWindowKVQAT(commandBuffer cb: MTLCommandBuffer,
+                           buf: MTLBuffer, bufOffset: Int = 0,
+                           rows: Int) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(windowQATPSO)
+        enc.setBuffer(buf, offset: bufOffset, index: 0)
+        var rowCount = UInt32(rows)
+        enc.setBytes(&rowCount, length: 4, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256,
+                                                                height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    func encodeWindowRoPEQAT(commandBuffer cb: MTLCommandBuffer,
+                             buf: MTLBuffer, bufOffset: Int = 0,
+                             gamma: MTLBuffer, gammaOffset: Int = 0,
+                             eps: Float,
+                             position: Float,
+                             config: V4RoPE.Config) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(windowRoPEQATPSO)
+        enc.setBuffer(buf, offset: bufOffset, index: 0)
+        enc.setBuffer(gamma, offset: gammaOffset, index: 1)
+        var epsilon = eps
+        var pos = position
+        var theta = config.theta
+        var factor = config.yarnFactor
+        var orig = config.originalSeqLen
+        var betaFast = config.betaFast
+        var betaSlow = config.betaSlow
+        var useYarn = UInt32(config.useYarn ? 1 : 0)
+        enc.setBytes(&epsilon, length: 4, index: 2)
+        enc.setBytes(&pos, length: 4, index: 3)
+        enc.setBytes(&theta, length: 4, index: 4)
+        enc.setBytes(&factor, length: 4, index: 5)
+        enc.setBytes(&orig, length: 4, index: 6)
+        enc.setBytes(&betaFast, length: 4, index: 7)
+        enc.setBytes(&betaSlow, length: 4, index: 8)
+        enc.setBytes(&useYarn, length: 4, index: 9)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256,
+                                                                height: 1, depth: 1))
         enc.endEncoding()
     }
 
