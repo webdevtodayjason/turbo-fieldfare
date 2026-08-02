@@ -293,6 +293,11 @@ zero-init vs the reference's -inf score state, and the indexer
 Hadamard + FP4 QAT sim (write-side), both invisible in these gates.
 True long-context (2K+) validation and NLL-style checks remain open
 until prefill kernels land (serial prompt feeding is ~0.7 s/token).
+
+Validation ladder (`Scripts/v4f/longctx_ladder.py`), 2026-08-02:
+88/153/259-token levels all pass (0 failures), spanning window-only,
+CSA-active, and HCA-active regimes. CLI `--messages-file` works for
+V4 via DSML framing (`40ee2e1`).
 - **Drift RESOLVED (2026-08-02, diagnosis worker):** two runner
   composition bugs, both in `V4ForwardRunner.forward`, both
   per-token uniform (kernels and cache manager exonerated):
