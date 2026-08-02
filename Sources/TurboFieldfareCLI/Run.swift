@@ -26,22 +26,29 @@ public func run(args: Args,
         if let rawPrompt = args.prompt {
             promptIds = tokenizer.encode(rawPrompt, addBOS: true)
         } else if let messagesFile = args.messagesFile {
-            if v4Family {
-                return errored(stderr,
-                               "--messages-file is not yet supported for V4 models; use --prompt",
-                               2)
-            }
             let data = try Data(contentsOf: URL(fileURLWithPath: messagesFile),
                                 options: [.mappedIfSafe])
             let rows = try JSONDecoder().decode([MessageJSON].self, from: data)
-            let messages = try rows.map { row -> GFTokenizer.Message in
-                guard let role = GFTokenizer.Role(rawValue: row.role) else {
-                    throw GFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
+            if v4Family {
+                let v4Messages = try rows.map { row -> V4Message in
+                    guard let role = V4Role(rawValue: row.role) else {
+                        throw GFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
+                    }
+                    return V4Message(role: role, content: row.content)
                 }
-                return GFTokenizer.Message(role: role, content: row.content)
+                let rendered = try V4ChatFormat.encodeMessages(v4Messages,
+                                                               thinkingMode: .chat)
+                promptIds = tokenizer.encode(rendered, addBOS: false)
+            } else {
+                let messages = try rows.map { row -> GFTokenizer.Message in
+                    guard let role = GFTokenizer.Role(rawValue: row.role) else {
+                        throw GFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
+                    }
+                    return GFTokenizer.Message(role: role, content: row.content)
+                }
+                let rendered = try tokenizer.applyChatTemplate(messages)
+                promptIds = tokenizer.encode(rendered, addBOS: false)
             }
-            let rendered = try tokenizer.applyChatTemplate(messages)
-            promptIds = tokenizer.encode(rendered, addBOS: false)
         } else {
             return errored(stderr, "one of --prompt or --messages-file is required", 2)
         }
