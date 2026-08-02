@@ -100,6 +100,8 @@ public final class MetalContext: @unchecked Sendable {
         "prefill_moe_v4",
         // V4F-06c-A1 batched prefill boundary (mHC, norms, RoPE).
         "prefill_boundary_v4",
+        // V4F-06c-A2 batched prefill projections, window attention, o-proj.
+        "prefill_proj_v4",
         // Hook: sibling wave work adds more V4 modules. Register them by
         // appending the name here plus one row in `shaderSubdirectories`
         // below; no other call-site change is needed.
@@ -121,6 +123,7 @@ public final class MetalContext: @unchecked Sendable {
         "prefill": "Metal/Prefill",
         "prefill_moe_v4": "Metal/Prefill",
         "prefill_boundary_v4": "Metal/Prefill",
+        "prefill_proj_v4": "Metal/Prefill",
         "rmsnorm": "Metal/Primitives",
         "rope": "Metal/Primitives",
         "tensorops": "Metal/TensorCore",
