@@ -75,11 +75,18 @@ struct ArchInfoV4: Sendable, Equatable {
             throw RepackError.configJsonInvalid(path: configPath, detail: "missing compress_ratios")
         }
         let numLayers = try i("num_hidden_layers")
-        guard ratios.count == numLayers else {
+        let numMTPLayers = (root["num_nextn_predict_layers"] as? Int)
+            ?? (root["num_nextn_predict_layers"] as? NSNumber)?.intValue ?? 0
+        // The published config carries one compress_ratio per transformer
+        // layer PLUS one per MTP module (trailing 0 on V4-Flash). MTP
+        // tensors are dropped at repack, so keep only the main-layer
+        // entries; reject any other count.
+        guard ratios.count == numLayers || ratios.count == numLayers + numMTPLayers else {
             throw RepackError.configJsonInvalid(
                 path: configPath,
-                detail: "compress_ratios count \(ratios.count) != num_hidden_layers \(numLayers)")
+                detail: "compress_ratios count \(ratios.count) != num_hidden_layers \(numLayers) (+ num_nextn_predict_layers \(numMTPLayers))")
         }
+        let layerRatios = Array(ratios.prefix(numLayers))
         let rope = (root["rope_scaling"] as? [String: Any]) ?? [:]
         func yarnD(_ k: String, _ fallback: Double) -> Double {
             (rope[k] as? Double) ?? (rope[k] as? NSNumber)?.doubleValue ?? fallback
@@ -96,8 +103,7 @@ struct ArchInfoV4: Sendable, Equatable {
             topKExperts: try i("num_experts_per_tok"),
             moeIntermediateSize: try i("moe_intermediate_size"),
             numHashLayers: try i("num_hash_layers"),
-            numMTPLayers: (root["num_nextn_predict_layers"] as? Int)
-                ?? (root["num_nextn_predict_layers"] as? NSNumber)?.intValue ?? 0,
+            numMTPLayers: numMTPLayers,
             numHeads: try i("num_attention_heads"),
             numKVHeads: try i("num_key_value_heads"),
             headDim: try i("head_dim"),
@@ -111,7 +117,7 @@ struct ArchInfoV4: Sendable, Equatable {
             slidingWindow: try i("sliding_window"),
             ropeTheta: try d("rope_theta"),
             compressRopeTheta: try d("compress_rope_theta"),
-            compressRatios: ratios,
+            compressRatios: layerRatios,
             routedScalingFactor: try d("routed_scaling_factor"),
             swigluLimit: try d("swiglu_limit"),
             normTopkProb: (root["norm_topk_prob"] as? Bool) ?? true,
