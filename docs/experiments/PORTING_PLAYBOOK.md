@@ -230,6 +230,40 @@ Wave 2+ status update (2026-08-01/02, branch `v4f`):
   Next gates: first-token validation vs the reference, then V4F-05
   holdouts. Prefill (V4F-06) and cross-layer pipelining remain open.
 
+First-token debugging dossier (2026-08-02, branch `v4f`):
+
+- Repack completed in 75 minutes; install verified.
+- First-run catches fixed en route: layout.json 16 MB metadata cap
+  (V4 layout is 17.1 MB; raised to 64 MB), tokenizer wrapper requiring
+  Gemma-only specials (added BOS/EOS-only V4 init + `loadV4`), chunked
+  prefill assumption (serial `.off` for the decode-only runner),
+  compress_ratios 44-entry config (43 layers + 1 MTP; layer 42 is CSA,
+  correcting a recon-era mask), resident 16-byte alignment for the
+  fp32 GEMV (staged widening + planner 16-pad).
+- Five real-checkpoint dtype corrections (verified against shard
+  headers): head.weight BF16 (widened at init), compressor wkv/wgate
+  BF16 (runner-owned BF16 projections), indexer compressor rows
+  256-dim, norm gammas BF16 (widened, cached), wo_a F8_E4M3 (two-stage
+  FP8 GEMV).
+- **First end-to-end generation achieved** (`1b2589e`): coherent
+  English for the first several tokens, then drift into repetition.
+- MoE exonerated by offline ground truth: dumped live xNorm/blobs/acts
+  and recomputed in numpy — CPU act rms 4.6171 vs kernel 4.6174,
+  row-level match 3e-5. Two probe-side bugs caused a false "29x
+  anomaly": a scale-grouping error in the Swift probe and a
+  synthetic-random-x numpy ground truth. Real xNorm drives real
+  experts much harder than random x.
+- Open: generation drift. Suspects in order: (1) window-KV
+  composition (ring slot, position, sinks) for generated tokens,
+  (2) RoPE/output de-rotation composition, (3) logits head path,
+  (4) mHC boundary details. Evidence: BOS stream explodes (4 -> 8000
+  rms) while normal tokens stay small (~0.17), consistent with
+  massive-activation literature and possibly all correct.
+- Debug instrumentation is env-gated (TURBO_V4_DEBUG) in
+  V4ForwardRunner.swift (`65a264c`); remove with the debug session.
+- `65a264c` also notes the debug dumps in `scratch/v4f-recon/`
+  (dbg-xNorm.bin, dbg-acts.bin, dbg-blob0/1.bin) for continuation.
+
 De-risking findings:
 
 - **cb1/cb2 survives.** CSA top-512 selection touches only GPU-resident
