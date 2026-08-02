@@ -259,20 +259,39 @@ public final class V4ForwardRunner {
             try encodeAttention(commandBuffer: cb1, layer: layer, kind: kind,
                                 tokenCount: tokenCount, ropeCfg: ropeCfg)
 
+            // Output de-rotation: complex conjugate at the QUERY position
+            // (reference: apply_rotary_emb(o[..., -rd:], freqs_cis, True)).
+            // The kernel's `inverse` flag already negates the sine term, so
+            // the position itself stays positive — passing -position here
+            // would re-rotate instead of de-rotating.
             rope.encode(commandBuffer: cb1, x: attnOut,
                         rows: model.config.numHeads, width: model.config.headDim,
                         ropeDim: model.config.qkRopeHeadDim,
-                        position: -Float(position), inverse: true, config: ropeCfg)
-            // Grouped output projection as two FP8 GEMVs (wo_a is
-            // F8_E4M3 [8192, 4096] group-major; wo_b is [4096, 8192]).
+                        position: Float(position), inverse: true, config: ropeCfg)
+            // Grouped output projection (reference: o.view(b,s,8,4096) then
+            // einsum("bsgd,grd->bsgr", o, wo_a)). wo_a is F8_E4M3
+            // [8192, 4096] group-major: rows [g*1024, (g+1)*1024) belong to
+            // group g and must dot with attnOut[g*4096 ..< (g+1)*4096]. The
+            // FP8 GEMV kernel is a plain y = W.x over one x slice, so loop
+            // the 8 groups with per-group weight/scale/x/y offsets.
             let woA = try model.woA(layer: layer)
             let woB = try model.woB(layer: layer)
-            fp8.encode(commandBuffer: cb1,
-                       weights: woA.buffer, weightsOffset: Int(woA.offset),
-                       scales: woA.buffer, scalesOffset: Int(woA.scaleOffset),
-                       x: attnOut, y: lowRank,
-                       m: UInt32(model.config.oGroups * model.config.oLoraRank),
-                       n: UInt32(dim))
+            let groupRows = model.config.oLoraRank              // 1024 rows per group
+            let groupDim = dim                                  // 4096 inputs per group
+            let scaleRowBytes = groupDim / 128                  // ue8m0 grid row width
+            for g in 0..<model.config.oGroups {
+                fp8.encode(commandBuffer: cb1,
+                           weights: woA.buffer,
+                           weightsOffset: Int(woA.offset) + g * groupRows * groupDim,
+                           scales: woA.buffer,
+                           scalesOffset: Int(woA.scaleOffset) + g * (groupRows / 128) * scaleRowBytes,
+                           x: attnOut,
+                           xOffset: g * groupDim * MemoryLayout<Float16>.size,
+                           y: lowRank,
+                           yOffset: g * groupRows * MemoryLayout<Float16>.size,
+                           m: UInt32(groupRows),
+                           n: UInt32(groupDim))
+            }
             fp8.encode(commandBuffer: cb1,
                        weights: woB.buffer, weightsOffset: Int(woB.offset),
                        scales: woB.buffer, scalesOffset: Int(woB.scaleOffset),
@@ -576,12 +595,15 @@ public final class V4ForwardRunner {
                         let gateBefore = stats16(sharedOut, ffn)
                         print(String(format: "V4DBG L00 standalone-gate-before rms=%.4f", gateBefore.0))
                         // Split probe: standalone FP4 GEMV for slot 1 gate.
-                        let gateOut = rowScratch   // >= 2048 fp32? rowScratch is fp32 [1024]; use logits instead
-                        _ = gateOut
-                        fp4.encode(commandBuffer: cbR, weights: blobs[1],
-                                   weightsOffset: Int(offsets.gateWOff),
-                                   scales: blobs[1], scalesOffset: Int(offsets.gateSOff),
-                                   x: xNorm, y: sharedOut, m: 2048, n: 4096)
+                        // (Fresh command buffer: cbR is already committed.)
+                        if let cbR2 = queue.makeCommandBuffer() {
+                            fp4.encode(commandBuffer: cbR2, weights: blobs[1],
+                                       weightsOffset: Int(offsets.gateWOff),
+                                       scales: blobs[1], scalesOffset: Int(offsets.gateSOff),
+                                       x: xNorm, y: sharedOut, m: 2048, n: 4096)
+                            cbR2.commit()
+                            await cbR2.completed()
+                        }
                     }
                     let codes = blobs[0].contents().assumingMemoryBound(to: UInt8.self)
                     let scales = blobs[0].contents().advanced(by: Int(offsets.gateSOff))

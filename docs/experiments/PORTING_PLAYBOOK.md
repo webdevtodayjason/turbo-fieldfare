@@ -259,6 +259,34 @@ First-token debugging dossier (2026-08-02, branch `v4f`):
   (4) mHC boundary details. Evidence: BOS stream explodes (4 -> 8000
   rms) while normal tokens stay small (~0.17), consistent with
   massive-activation literature and possibly all correct.
+- **Drift RESOLVED (2026-08-02, diagnosis worker):** two runner
+  composition bugs, both in `V4ForwardRunner.forward`, both
+  per-token uniform (kernels and cache manager exonerated):
+  (a) output de-rotation passed `position: -position` AND
+  `inverse: true` to `v4b_rope_trailing`, whose inverse flag already
+  conjugates — the double negation re-rotated the attention output
+  at +p instead of de-rotating (reference:
+  `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` at the query
+  position). Fixed to positive position + inverse.
+  (b) the grouped o-projection ran wo_a F8 [8192, 4096] as ONE plain
+  GEMV over `attnOut[0..4096]`; the reference views o as
+  [8, 4096] and dots group g's 1024 rows with slice g
+  (`einsum("bsgd,grd->bsgr")`). Rows 1024..8191 (7/8 of the low-rank
+  stage) consumed the wrong input slice. Fixed by looping 8 groups
+  with per-group weight/scale/x/y offsets (kernel unchanged).
+  Also fixed a pre-existing TURBO_V4_DEBUG probe that encoded into
+  an already-committed command buffer (crashed debug runs at L00).
+  Verification: greedy "The capital of France is" went from
+  " the capital of the... ... ... ...package ..." to
+  " Paris, the city of love, the city of lights, ..."; a 25-token
+  prompt yields " Paris. The capital of France is Paris. ... The
+  capital of Germany is Berlin." (no position-dependent breakage).
+  122/122 filtered tests green. Short-context note: compressed
+  entries are never attended below 129 tokens (visibleGroupCount
+  gates on windowStart > 0), so CSA/HCA compressor details cannot
+  cause short-generation drift; the group-0 overlap zero-vs-(-inf)
+  gate-score difference vs the reference remains a long-context
+  follow-up.
 - Debug instrumentation is env-gated (TURBO_V4_DEBUG) in
   V4ForwardRunner.swift (`65a264c`); remove with the debug session.
 - `65a264c` also notes the debug dumps in `scratch/v4f-recon/`
