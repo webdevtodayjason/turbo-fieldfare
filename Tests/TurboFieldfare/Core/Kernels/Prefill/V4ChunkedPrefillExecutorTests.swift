@@ -26,7 +26,9 @@ import TurboFieldfareValidationSupport
         let cb = ctx.queue.makeCommandBuffer()!
         exec.encode(commandBuffer: cb, layer: 0, startPosition: 0, rowCount: rows, inputs: input)
         cb.commit(); cb.waitUntilCompleted()
-        #expect(cb.status == .completed); #expect(cache.position == rows)
+        #expect(cb.status == .completed); #expect(cache.position == 0)
+        cache.advance(by: rows)
+        #expect(cache.position == rows)
         let actual = Fp16Buffer.read(input.output, count: rows * Self.heads * Self.dim)
         for row in 0..<rows {
             let qBase = row * Self.heads * Self.dim
@@ -52,13 +54,39 @@ import TurboFieldfareValidationSupport
         #expect(out[0] < out[2 * Self.heads * Self.dim])
     }
 
+    @Test func twoLayerExecutorsShareStartPosition_beforeExternalAdvance() throws {
+        let rows = 3
+        let ctx = try MetalContext()
+        let cache = try CompressedKVCacheManager(device: ctx.device,
+                                                 config: V4CacheConfig(compressRatios: [0, 0]),
+                                                 maxContext: 128)
+        let attn = try V4Attention(device: ctx.device, maxContext: 128)
+        let layer0 = try V4ChunkedPrefillExecutor(device: ctx.device, cache: cache, attention: attn)
+        let layer1 = try V4ChunkedPrefillExecutor(device: ctx.device, cache: cache, attention: attn)
+        var q = [Float16](repeating: 0, count: rows * Self.heads * Self.dim)
+        for row in 0..<rows { for h in 0..<Self.heads { q[row * Self.heads * Self.dim + h * Self.dim] = 1 } }
+        let kv = [Float16](repeating: 0.125, count: rows * Self.dim)
+        let sinks = [Float](repeating: -10, count: Self.heads)
+        let input0 = inputs(ctx.device, rows: rows, q: q, kv: kv, sinks: sinks)
+        let input1 = inputs(ctx.device, rows: rows, q: q, kv: kv, sinks: sinks)
+        let cb = ctx.queue.makeCommandBuffer()!
+        layer0.encode(commandBuffer: cb, layer: 0, startPosition: 0, rowCount: rows, inputs: input0)
+        layer1.encode(commandBuffer: cb, layer: 1, startPosition: 0, rowCount: rows, inputs: input1)
+        cb.commit(); cb.waitUntilCompleted()
+        #expect(cb.status == .completed)
+        #expect(cache.position == 0)
+        cache.advance(by: rows)
+        #expect(cache.position == rows)
+    }
+
     @Test func csaGroupCompletionCarryAndDisjointness() throws {
         let (ctx, cache, exec) = try objects(V4CacheConfig(compressRatios: [4]), maxContext: 256)
         let c = compressedInputs(ctx.device, rows: 8, kind: .csa)
         let cb = ctx.queue.makeCommandBuffer()!
         exec.encode(commandBuffer: cb, layer: 0, startPosition: 0, rowCount: 8, inputs: c.inputs, compressorWeights: c.weights, rope: .passthroughLayer)
         cb.commit(); cb.waitUntilCompleted()
-        #expect(cb.status == .completed); #expect(cache.position == 8); #expect(cache.completedGroupCount(layer: 0) == 2)
+        #expect(cb.status == .completed); #expect(cache.position == 0)
+        #expect(cache.completedGroupCount(layer: 0, tokenCount: 8) == 2)
         #expect(cache.visibleGroupCount(layer: 0, windowStart: 4, tokenCount: 8) == 1)
         cache.assertDisjointCoverage(layer: 0, groupCount: 0, tokenCount: 8)
     }
@@ -69,7 +97,8 @@ import TurboFieldfareValidationSupport
         let cb = ctx.queue.makeCommandBuffer()!
         exec.encode(commandBuffer: cb, layer: 0, startPosition: 0, rowCount: 128, inputs: c.inputs, compressorWeights: c.weights, rope: .passthroughLayer)
         cb.commit(); cb.waitUntilCompleted()
-        #expect(cb.status == .completed); #expect(cache.position == 128); #expect(cache.completedGroupCount(layer: 0) == 1)
+        #expect(cb.status == .completed); #expect(cache.position == 0)
+        #expect(cache.completedGroupCount(layer: 0, tokenCount: 128) == 1)
     }
 
     @Test func rowCausality_windowDoesNotReadFutureRows() throws {

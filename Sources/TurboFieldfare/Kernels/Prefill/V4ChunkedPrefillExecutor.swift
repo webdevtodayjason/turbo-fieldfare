@@ -5,6 +5,14 @@ import Metal
 /// compressor, and decode kernels. Rows are encoded in causal order into the
 /// caller's command buffer: write current window KV, stage/flush completed
 /// compressed groups, then decode with tokenCount = startPosition + row + 1.
+///
+/// The executor does not advance `CompressedKVCacheManager.position`. Layer-major
+/// prefill must run the same `[startPosition, startPosition + rowCount)` chunk
+/// through every layer, then the caller advances the shared cache cursor once by
+/// `rowCount` after all layers complete.
+///
+/// Create one executor instance per layer. CSA/HCA staging accumulators are held
+/// by the executor and must not be shared across layers.
 final class V4ChunkedPrefillExecutor {
     struct Inputs {
         let q: MTLBuffer; let qOffset: Int
@@ -102,7 +110,6 @@ final class V4ChunkedPrefillExecutor {
             let nVisible = cache.visibleGroupCount(layer: layer, windowStart: max(0, tokenCount - config.window), tokenCount: tokenCount)
             cache.assertDisjointCoverage(layer: layer, groupCount: nVisible, tokenCount: tokenCount)
             decode(cb, layer, kind, tokenCount, nVisible, row, inputs)
-            cache.advance()
         }
     }
 
