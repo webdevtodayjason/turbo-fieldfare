@@ -71,7 +71,10 @@ func runV4(args: Args,
             promptIds: promptIds,
             config: v4Config,
             context: context,
-            scratch: scratch) { progress in
+            scratch: scratch,
+            // Decode-only runner: prompt tokens feed serially through
+            // `produce` (V4F-06 prefill kernels replace this).
+            prefillConfig: .off) { progress in
                 switch progress {
                 case .prefill:
                     break
