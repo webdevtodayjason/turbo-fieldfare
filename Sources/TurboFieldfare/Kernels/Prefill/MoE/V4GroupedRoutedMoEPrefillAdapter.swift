@@ -90,6 +90,7 @@ final class V4GroupedRoutedMoEPrefillAdapter {
 
     func encode(model: V4Model, hidden: MTLBuffer, hiddenOffset: Int = 0,
                 tokenMajorExpertIDs: [UInt32], tokenMajorWeights: [Float],
+                residual: MTLBuffer? = nil, residualOffset: Int = 0,
                 layer: Int, chunkSize queryCount: Int, d: Int, routedIntermediate: Int,
                 hiddenStrideElements: Int? = nil, pairMicrobatchRows: Int = 32) async throws
         -> V4GroupedRoutedMoEPrefillOutput {
@@ -101,6 +102,7 @@ final class V4GroupedRoutedMoEPrefillAdapter {
         }
         return try await encode(provider: model, hidden: hidden, hiddenOffset: hiddenOffset, pairs: pairs,
                                 routeWeights: routeWeights, routeWeightsOffset: 0,
+                                residual: residual, residualOffset: residualOffset,
                                 layer: layer, queryCount: queryCount, numExperts: model.config.numExperts,
                                 d: d, routedIntermediate: routedIntermediate,
                                 hiddenStrideElements: hiddenStrideElements ?? d,
@@ -109,6 +111,7 @@ final class V4GroupedRoutedMoEPrefillAdapter {
 
     func encode(provider: V4GroupedRoutedMoEPrefillExpertProvider, hidden: MTLBuffer, hiddenOffset: Int = 0,
                 pairs: [PrefillTokenExpertPair], routeWeights: MTLBuffer, routeWeightsOffset: Int = 0,
+                residual: MTLBuffer? = nil, residualOffset: Int = 0,
                 layer: Int, queryCount: Int, numExperts: Int, d: Int, routedIntermediate: Int,
                 hiddenStrideElements: Int, pairMicrobatchRows: Int = 32) async throws
         -> V4GroupedRoutedMoEPrefillOutput {
@@ -116,15 +119,19 @@ final class V4GroupedRoutedMoEPrefillAdapter {
         guard let sortedPairs = makeBuffer(bytes: routes.sortedPairs, label: "prefill.groupedMoeV4.sortedPairs") else {
             throw V4GroupedRoutedMoEPrefillAdapterError.allocationFailed("prefill V4 sorted route pairs")
         }
-        let routePartials = try makeEmptyBuffer(length: queryCount * PrefillGroupedRoutedMoEV4.topK * d * MemoryLayout<Float16>.stride,
+        let routePartials = try makeEmptyBuffer(length: queryCount * PrefillGroupedRoutedMoEV4.topK * d * MemoryLayout<Float>.stride,
                                                 label: "prefill.groupedMoeV4.routePartials")
         let output = try makeEmptyBuffer(length: queryCount * d * MemoryLayout<Float16>.stride,
                                          label: "prefill.groupedMoeV4.output")
+        let reductionResidual = try residual ?? makeEmptyBuffer(
+            length: queryCount * d * MemoryLayout<Float16>.stride,
+            label: "prefill.groupedMoeV4.zeroResidual")
         let acts = try makeEmptyBuffer(length: max(1, min(pairMicrobatchRows, max(1, routes.maxPairsPerTile))) * routedIntermediate * MemoryLayout<Float16>.stride,
                                        label: "prefill.groupedMoeV4.actsScratch")
         try await encodeTiles(provider: provider, routes: routes, hidden: hidden, hiddenOffset: hiddenOffset,
                               sortedPairs: sortedPairs, routePartials: routePartials, acts: acts,
                               output: output, routeWeights: routeWeights, routeWeightsOffset: routeWeightsOffset,
+                              residual: reductionResidual, residualOffset: residualOffset,
                               layer: layer, queryCount: queryCount, d: d, routedIntermediate: routedIntermediate,
                               hiddenStrideElements: hiddenStrideElements, pairMicrobatchRows: pairMicrobatchRows)
         return V4GroupedRoutedMoEPrefillOutput(routes: routes, sortedPairs: sortedPairs,
@@ -134,7 +141,9 @@ final class V4GroupedRoutedMoEPrefillAdapter {
     private func encodeTiles(provider: V4GroupedRoutedMoEPrefillExpertProvider, routes: PrefillMoEGroupedRoutes,
                              hidden: MTLBuffer, hiddenOffset: Int, sortedPairs: MTLBuffer,
                              routePartials: MTLBuffer, acts: MTLBuffer, output: MTLBuffer,
-                             routeWeights: MTLBuffer, routeWeightsOffset: Int, layer: Int, queryCount: Int,
+                             routeWeights: MTLBuffer, routeWeightsOffset: Int,
+                             residual: MTLBuffer, residualOffset: Int,
+                             layer: Int, queryCount: Int,
                              d: Int, routedIntermediate: Int, hiddenStrideElements: Int,
                              pairMicrobatchRows: Int) async throws {
         let offsets = provider.routedExpertV4Offsets(layer: layer)
@@ -188,6 +197,7 @@ final class V4GroupedRoutedMoEPrefillAdapter {
                 hiddenStrideElements: UInt32(hiddenStrideElements), binding: binding, offsets: offsets)
             moe.encodeStreamedTile(commandBuffer: commandBuffer, hidden: hidden, hiddenOffset: hiddenOffset,
                                    sortedPairs: sortedPairs, acts: acts, routePartials: routePartials,
+                                   routeWeights: routeWeights, routeWeightsOffset: routeWeightsOffset,
                                    argumentBuffer: argumentBuffer, binding: binding, params: params,
                                    pairMicrobatchRows: pairMicrobatchRows)
             commandBuffer.commit()
@@ -199,7 +209,7 @@ final class V4GroupedRoutedMoEPrefillAdapter {
 
         let reduceCommandBuffer = try makeCommandBuffer()
         moe.encodeReduceTokenMajor(commandBuffer: reduceCommandBuffer, routePartials: routePartials,
-                                   routeWeights: routeWeights, routeWeightsOffset: routeWeightsOffset,
+                                   residual: residual, residualOffset: residualOffset,
                                    h2: output, queryCount: UInt32(queryCount),
                                    topK: UInt32(PrefillGroupedRoutedMoEV4.topK), d: UInt32(d))
         reduceCommandBuffer.commit()

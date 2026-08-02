@@ -14,6 +14,7 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
     static let threadsPerGroup = 256
 
     private let embeddingPSO: MTLComputePipelineState
+    private let routerGemvPSO: MTLComputePipelineState
     private let topKPSO: MTLComputePipelineState
     private let hashWeightsPSO: MTLComputePipelineState
     private let addF16PSO: MTLComputePipelineState
@@ -21,6 +22,8 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
     init(device: MTLDevice) throws {
         self.embeddingPSO = try Self.pipeline(device: device,
                                              name: "v4cg_bf16_embedding_gather_broadcast")
+        self.routerGemvPSO = try Self.pipeline(device: device,
+                                              name: "v4cg_bf16_gemm_serial_order")
         self.topKPSO = try Self.pipeline(device: device,
                                         name: "v4cg_router_top6_sqrtsoftplus")
         self.hashWeightsPSO = try Self.pipeline(device: device,
@@ -81,6 +84,37 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
         enc.endEncoding()
     }
 
+    /// Batched BF16 projection using the exact per-lane FMA and SIMD reduction
+    /// order of the serial `router_v4_gemv_bf16` kernel.
+    func encodeBF16GEMMSerialOrder(commandBuffer cb: MTLCommandBuffer,
+                                   weights: MTLBuffer,
+                                   weightsOffset: Int = 0,
+                                   hidden: MTLBuffer,
+                                   hiddenOffset: Int = 0,
+                                   output: MTLBuffer,
+                                   outputOffset: Int = 0,
+                                   rows: Int,
+                                   outputRows: Int,
+                                   dim: Int) {
+        precondition(rows > 0 && outputRows > 0)
+        precondition(dim.isMultiple(of: 64))
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(routerGemvPSO)
+        enc.setBuffer(weights, offset: weightsOffset, index: 0)
+        enc.setBuffer(hidden, offset: hiddenOffset, index: 1)
+        enc.setBuffer(output, offset: outputOffset, index: 2)
+        var r = UInt32(rows)
+        var m = UInt32(outputRows)
+        var d = UInt32(dim)
+        enc.setBytes(&r, length: 4, index: 3)
+        enc.setBytes(&m, length: 4, index: 4)
+        enc.setBytes(&d, length: 4, index: 5)
+        enc.dispatchThreadgroups(
+            MTLSize(width: rows * ((outputRows + 3) / 4), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
     /// Select top-6 experts from fp32 logits with `staticBias` applied only to
     /// the selection key. Weights are un-biased sqrtsoftplus scores normalized
     /// over the selected IDs and multiplied by `routeScale`.
@@ -106,7 +140,8 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
         var scale = routeScale
         enc.setBytes(&r, length: 4, index: 4)
         enc.setBytes(&scale, length: 4, index: 5)
-        dispatch1D(enc, pso: topKPSO, threads: rows)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         enc.endEncoding()
     }
 
@@ -131,7 +166,8 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
         var scale = routeScale
         enc.setBytes(&r, length: 4, index: 3)
         enc.setBytes(&scale, length: 4, index: 4)
-        dispatch1D(enc, pso: hashWeightsPSO, threads: rows)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         enc.endEncoding()
     }
 

@@ -144,6 +144,40 @@ final class V4DecodeGlue {
         enc.endEncoding()
     }
 
+    /// Batched prefill binding of the exact decode hash-router PSO. Each row
+    /// is dispatched independently with buffer offsets, so arithmetic and
+    /// compiler code generation are identical to scalar decode.
+    func encodeRouterWeightsAtIndicesBatchedSerial(commandBuffer cb: MTLCommandBuffer,
+                                                   logits: MTLBuffer,
+                                                   indices: MTLBuffer,
+                                                   outWeights: MTLBuffer,
+                                                   rows: Int,
+                                                   expertCount: Int,
+                                                   k: UInt32,
+                                                   routeScale: Float) {
+        precondition(rows > 0 && expertCount > 0)
+        var count = k
+        var scale = routeScale
+        for row in 0..<rows {
+            guard let enc = cb.makeComputeCommandEncoder() else { return }
+            enc.setComputePipelineState(hashWeightsPSO)
+            enc.setBuffer(logits,
+                          offset: row * expertCount * MemoryLayout<Float>.stride,
+                          index: 0)
+            enc.setBuffer(indices,
+                          offset: row * Int(k) * MemoryLayout<Int32>.stride,
+                          index: 1)
+            enc.setBuffer(outWeights,
+                          offset: row * Int(k) * MemoryLayout<Float>.stride,
+                          index: 2)
+            enc.setBytes(&count, length: 4, index: 3)
+            enc.setBytes(&scale, length: 4, index: 4)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding()
+        }
+    }
+
     /// BF16-weight GEMV, fp16 x, fp32 out (`router_v4_gemv_bf16` from
     /// `moe_v4`). Used for indexer weights_proj and hash-layer router
     /// logits, which `MoEV4.encodeRouterV4` does not expose standalone.

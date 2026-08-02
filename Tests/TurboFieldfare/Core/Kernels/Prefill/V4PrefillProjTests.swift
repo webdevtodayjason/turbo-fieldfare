@@ -174,6 +174,41 @@ import TurboFieldfareValidationSupport
         #expect(rel < Tolerance.fp16ChainedReduction, "wq_a fp16 rel=\(rel)")
     }
 
+    @Test func fp8GEMM_fp16Out_matchesSerialKernelBitExactlyAcrossRows() throws {
+        var rng = SeedTree(0xA06).key("fp8-batched-vs-serial")
+        let rows = 3, m = 512, n = 4096
+        let matrix = Self.randomFP8Matrix(m: m, n: n, rng: &rng)
+        let hidden = (0..<(rows * n)).map { _ in Float16(rng.uniform(-0.5, 0.5)) }
+        let ctx = try MetalContext()
+        let proj = try V4PrefillProj(device: ctx.device)
+        let serial = try DequantFP8BlockGEMV(context: ctx)
+        guard let weights = ctx.device.makeBuffer(bytes: matrix.codes, length: matrix.codes.count,
+                                                  options: .storageModeShared),
+              let scales = ctx.device.makeBuffer(bytes: matrix.scales, length: matrix.scales.count,
+                                                 options: .storageModeShared),
+              let x = Fp16Buffer.make(ctx.device, halves: hidden),
+              let batched = Fp16Buffer.make(ctx.device, count: rows * m),
+              let reference = Fp16Buffer.make(ctx.device, count: rows * m) else {
+            Issue.record("alloc failed"); return
+        }
+        let cb = ctx.queue.makeCommandBuffer()!
+        proj.encodeFP8GEMM(commandBuffer: cb, weights: weights, scales: scales,
+                           x: x, out: batched, rows: rows, m: m, n: n,
+                           outFP16: true)
+        for row in 0..<rows {
+            serial.encode(commandBuffer: cb,
+                          weights: weights,
+                          scales: scales,
+                          x: x, xOffset: row * n * MemoryLayout<Float16>.stride,
+                          y: reference, yOffset: row * m * MemoryLayout<Float16>.stride,
+                          m: UInt32(m), n: UInt32(n))
+        }
+        cb.commit(); cb.waitUntilCompleted()
+        #expect(Fp16Buffer.read(batched, count: rows * m) ==
+                Fp16Buffer.read(reference, count: rows * m),
+                "batched FP8 fp16 output must be bit-exact to serial GEMV")
+    }
+
     // MARK: - 2. BF16 GEMM shapes
 
     private func runBF16Shape(m: Int, seed: UInt64, label: String) throws -> Float {

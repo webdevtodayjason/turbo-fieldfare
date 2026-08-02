@@ -119,6 +119,45 @@ final class MoEV4 {
         }
     }
 
+    /// Batched prefill binding of the exact decode top-6 selector PSO. The
+    /// router GEMM is encoded separately; this method dispatches one scalar
+    /// decode selector per row with buffer offsets, preserving token-exact
+    /// selection and normalization arithmetic.
+    func encodeRouterSelectV4BatchedSerial(commandBuffer: MTLCommandBuffer,
+                                           logits: MTLBuffer,
+                                           bias: MTLBuffer,
+                                           biasOffset: Int = 0,
+                                           outIndices: MTLBuffer,
+                                           outWeights: MTLBuffer,
+                                           rows: Int,
+                                           numExperts: UInt32,
+                                           routeScale: Float = 1.5) {
+        precondition(rows > 0)
+        precondition(numExperts >= UInt32(Self.maxStreamedExperts) && numExperts <= 256)
+        var expertCount = numExperts
+        var scale = routeScale
+        for row in 0..<rows {
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+            encoder.setComputePipelineState(routerSelectPSO)
+            encoder.setBuffer(logits,
+                              offset: row * Int(numExperts) * MemoryLayout<Float>.stride,
+                              index: 0)
+            encoder.setBuffer(bias, offset: biasOffset, index: 1)
+            encoder.setBuffer(outIndices,
+                              offset: row * Self.maxStreamedExperts * MemoryLayout<UInt32>.stride,
+                              index: 2)
+            encoder.setBuffer(outWeights,
+                              offset: row * Self.maxStreamedExperts * MemoryLayout<Float>.stride,
+                              index: 3)
+            encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 4)
+            encoder.setBytes(&scale, length: MemoryLayout<Float>.stride, index: 5)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
     func makeRoutedArgumentBuffer(routedBlobs: [MTLBuffer],
                                   topK: UInt32) -> MTLBuffer? {
         validate(routedBlobs: routedBlobs, topK: topK)

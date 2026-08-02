@@ -118,12 +118,12 @@ import TurboFieldfareValidationSupport
         }
         cb.commit(); cb.waitUntilCompleted()
 
-        let qRel = RelError.compute(actual: Fp16Buffer.read(batchedQ, count: rows * heads * headDim),
-                                    reference: Fp16Buffer.read(refQ, count: rows * heads * headDim))
-        #expect(qRel < Tolerance.fp16ChainedReduction, "q rel=\(qRel)")
-        let kvRel = RelError.compute(actual: Fp16Buffer.read(batchedKV, count: rows * headDim),
-                                     reference: Fp16Buffer.read(refKV, count: rows * headDim))
-        #expect(kvRel < Tolerance.fp16ChainedReduction, "kv rel=\(kvRel)")
+        let batchedQValues = Fp16Buffer.read(batchedQ, count: rows * heads * headDim)
+        let refQValues = Fp16Buffer.read(refQ, count: rows * heads * headDim)
+        #expect(batchedQValues == refQValues, "batched Q must be bit-exact to decode")
+        let batchedKVValues = Fp16Buffer.read(batchedKV, count: rows * headDim)
+        let refKVValues = Fp16Buffer.read(refKV, count: rows * headDim)
+        #expect(batchedKVValues == refKVValues, "batched window KV must be bit-exact to decode")
         if includeIndexer, let batchedIndexQ, let refIndexQ, let indexWeightsIn, let indexWeightsOut {
             let idxRel = RelError.compute(actual: Fp16Buffer.read(batchedIndexQ, count: rows * heads * indexDim),
                                           reference: Fp16Buffer.read(refIndexQ, count: rows * heads * indexDim))

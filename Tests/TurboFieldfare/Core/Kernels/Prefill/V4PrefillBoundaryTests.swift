@@ -263,8 +263,7 @@ import TurboFieldfareValidationSupport
             decodeAll += Self.readF32(decode.paramsBuffer, count: 24)
         }
         let got = Self.readF32(s.boundary.paramsBuffer, count: rows * 24)
-        let rel = RelError.compute(actual: got, reference: decodeAll)
-        #expect(rel < 1e-6, "batched vs decode params rel=\(rel)")
+        #expect(got == decodeAll, "batched params must be bit-exact to decode")
     }
 
     // MARK: - Batched pre gather + post merge
@@ -383,6 +382,42 @@ import TurboFieldfareValidationSupport
         let gotNoGamma = Fp16Buffer.read(ybNoGamma, count: rows * n)
         let relNG = RelError.compute(actual: gotNoGamma, reference: refNoGamma)
         #expect(relNG < Tolerance.fp16Reduction, "rmsnorm no-gamma rel=\(relNG)")
+    }
+
+    @Test func rmsnormSerialOrder_128RowsMatchesDecodeBitExactly() throws {
+        let rows = 128
+        let n = Self.dim
+        var rng = SeedTree(0xC06128).key("rms-pf-serial-order")
+        let x = (0..<(rows * n)).map { _ in rng.uniform(-2, 2) }
+        let gamma = (0..<n).map { _ in rng.uniform(0.5, 1.5) }
+        let ctx = try MetalContext()
+        let boundary = try V4PrefillBoundary(device: ctx.device, maxRows: rows)
+        let serial = try V4DecodeGlue(context: ctx)
+        guard let xb = Self.f32buf(ctx.device, x),
+              let gb = Self.f32buf(ctx.device, gamma),
+              let batched = Fp16Buffer.make(ctx.device, count: rows * n),
+              let reference = Fp16Buffer.make(ctx.device, count: rows * n) else {
+            Issue.record("alloc failed"); return
+        }
+
+        let cb = ctx.queue.makeCommandBuffer()!
+        boundary.encodeRMSNormSerialOrder(commandBuffer: cb,
+                                          x: xb, gamma: gb, out: batched,
+                                          rows: rows, n: n, eps: Self.normEps)
+        for row in 0..<rows {
+            serial.encodeRMSNormF32In(
+                commandBuffer: cb,
+                x: xb, xOffset: row * n * MemoryLayout<Float>.size,
+                w: gb,
+                out: reference, outOffset: row * n * MemoryLayout<Float16>.size,
+                dim: UInt32(n), eps: Self.normEps)
+        }
+        cb.commit(); cb.waitUntilCompleted()
+
+        let got = Fp16Buffer.read(batched, count: rows * n)
+        let expected = Fp16Buffer.read(reference, count: rows * n)
+        #expect(got == expected,
+                "serial-order batched RMSNorm must match decode bit-for-bit")
     }
 
     // MARK: - Batched per-row-position RoPE

@@ -9,9 +9,15 @@ static inline float v4cg_bf16(uint16_t bits) {
 }
 
 static inline float v4cg_sqrtsoftplus(float x) {
-    // Stable softplus: max(x, 0) + log(1 + exp(-abs(x))).
-    const float sp = max(x, 0.0f) + log(1.0f + exp(-fabs(x)));
-    return sqrt(sp);
+    // Exact arithmetic shape used by router_v4_topk_select_k6.
+    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    return sqrt(max(sp, 0.0f));
+}
+
+static inline float v4cg_hash_sqrtsoftplus(float x) {
+    // Exact arithmetic shape used by v4c_router_weights_at_indices.
+    const float sp = x > 20.0f ? x : fast::log(1.0f + fast::exp(x));
+    return fast::sqrt(max(sp, 0.0f));
 }
 
 kernel void v4cg_bf16_embedding_gather_broadcast(
@@ -35,61 +41,90 @@ kernel void v4cg_bf16_embedding_gather_broadcast(
     out[base + uint64_t(3u) * dim] = value;
 }
 
+// Batched form of `router_v4_gemv_bf16` with deliberately identical
+// per-lane accumulation and SIMD reduction order. It is generic over output
+// rows and covers routers, compressor projections, and indexer weights.
+kernel void v4cg_bf16_gemm_serial_order(
+    device const uint16_t* W [[buffer(0)]], // [outRows, dim] bf16 bits
+    device const half* X [[buffer(1)]],     // [rows, dim]
+    device float* output [[buffer(2)]],     // [rows, outRows]
+    constant uint& rows [[buffer(3)]],
+    constant uint& outRows [[buffer(4)]],
+    constant uint& dim [[buffer(5)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint outputTiles = (outRows + 3u) / 4u;
+    const uint row = tg / outputTiles;
+    const uint outputRow = (tg % outputTiles) * 4u + sg;
+    if (row >= rows || outputRow >= outRows) { return; }
+
+    device const uint16_t* Wrow = W + uint64_t(outputRow) * dim;
+    device const half* Xrow = X + uint64_t(row) * dim;
+    float acc = 0.0f;
+    for (uint base = 0; base < dim; base += 64u) {
+        const uint i0 = base + lane * 2u;
+        acc = fma(v4cg_bf16(Wrow[i0]), float(Xrow[i0]), acc);
+        acc = fma(v4cg_bf16(Wrow[i0 + 1u]), float(Xrow[i0 + 1u]), acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) { output[uint64_t(row) * outRows + outputRow] = acc; }
+}
+
 kernel void v4cg_router_top6_sqrtsoftplus(
     device const float* logits [[buffer(0)]],     // [rows, 256]
     device const float* staticBias [[buffer(1)]], // [256], selection only
-    device int* outIDs [[buffer(2)]],             // [rows, 6]
+    device uint* outIDs [[buffer(2)]],            // [rows, 6]
     device float* outWeights [[buffer(3)]],       // [rows, 6]
     constant uint& rows [[buffer(4)]],
     constant float& routeScale [[buffer(5)]],
-    uint row [[thread_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
 ) {
-    if (row >= rows) { return; }
+    if (row >= rows || tid != 0u) { return; }
+    device const float* rowLogits = logits + uint64_t(row) * 256ull;
+    device uint* rowIDs = outIDs + uint64_t(row) * 6ull;
+    device float* rowWeights = outWeights + uint64_t(row) * 6ull;
 
-    int bestID[6] = {0, 1, 2, 3, 4, 5};
-    float bestKey[6];
+    // Deliberately mirror router_v4_topk_select_k6 statement-for-statement.
+    uint top_idx[6];
+    float top_sel[6];
+    float top_score[6];
     for (uint i = 0; i < 6; ++i) {
-        const uint eid = i;
-        bestKey[i] = v4cg_sqrtsoftplus(logits[uint64_t(row) * 256ull + eid] + staticBias[eid]);
+        top_idx[i] = 0u;
+        top_sel[i] = -INFINITY;
+        top_score[i] = 0.0f;
     }
-    // Sort initial six by descending key, lower ID first for ties.
-    for (uint i = 1; i < 6; ++i) {
-        const int id = bestID[i];
-        const float key = bestKey[i];
-        int j = int(i) - 1;
-        while (j >= 0 && (key > bestKey[j] || (key == bestKey[j] && id < bestID[j]))) {
-            bestID[j + 1] = bestID[j];
-            bestKey[j + 1] = bestKey[j];
-            --j;
-        }
-        bestID[j + 1] = id;
-        bestKey[j + 1] = key;
-    }
-
-    for (uint eid = 6; eid < 256; ++eid) {
-        const float key = v4cg_sqrtsoftplus(logits[uint64_t(row) * 256ull + eid] + staticBias[eid]);
-        if (key > bestKey[5] || (key == bestKey[5] && int(eid) < bestID[5])) {
-            int j = 4;
-            while (j >= 0 && (key > bestKey[j] || (key == bestKey[j] && int(eid) < bestID[j]))) {
-                bestID[j + 1] = bestID[j];
-                bestKey[j + 1] = bestKey[j];
-                --j;
+    for (uint e = 0; e < 256u; ++e) {
+        const float l = rowLogits[e];
+        const float sp = (l > 20.0f) ? l : log(1.0f + exp(l));
+        const float s = sqrt(max(sp, 0.0f));
+        const float sel = s + staticBias[e];
+        if (sel <= top_sel[5]) continue;
+        uint pos = 6u;
+        for (uint i = 0; i < 6; ++i) {
+            if (sel > top_sel[i] || (sel == top_sel[i] && e < top_idx[i])) {
+                pos = i;
+                break;
             }
-            bestID[j + 1] = int(eid);
-            bestKey[j + 1] = key;
         }
+        if (pos >= 6u) continue;
+        for (uint i = 5; i > pos; --i) {
+            top_idx[i] = top_idx[i - 1];
+            top_sel[i] = top_sel[i - 1];
+            top_score[i] = top_score[i - 1];
+        }
+        top_idx[pos] = e;
+        top_sel[pos] = sel;
+        top_score[pos] = s;
     }
-
     float sum = 0.0f;
-    float scores[6];
+    for (uint i = 0; i < 6; ++i) sum += top_score[i];
+    const float inv_sum = 1.0f / sum;
     for (uint i = 0; i < 6; ++i) {
-        scores[i] = v4cg_sqrtsoftplus(logits[uint64_t(row) * 256ull + uint(bestID[i])]);
-        sum += scores[i];
-    }
-    const float inv = (sum > 0.0f) ? (routeScale / sum) : 0.0f;
-    for (uint i = 0; i < 6; ++i) {
-        outIDs[uint64_t(row) * 6ull + i] = bestID[i];
-        outWeights[uint64_t(row) * 6ull + i] = scores[i] * inv;
+        rowIDs[i] = top_idx[i];
+        rowWeights[i] = top_score[i] * inv_sum * routeScale;
     }
 }
 
@@ -99,20 +134,25 @@ kernel void v4cg_hash_router_weights_sqrtsoftplus(
     device float* outWeights [[buffer(2)]],    // [rows, 6]
     constant uint& rows [[buffer(3)]],
     constant float& routeScale [[buffer(4)]],
-    uint row [[thread_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
 ) {
-    if (row >= rows) { return; }
-    float scores[6];
+    if (row >= rows || lid != 0u) { return; }
+    device const float* rowLogits = logits + uint64_t(row) * 256ull;
+    device const int* rowIDs = tid2eid + uint64_t(row) * 6ull;
+    device float* rowWeights = outWeights + uint64_t(row) * 6ull;
+
+    // Deliberately mirror v4c_router_weights_at_indices statement-for-statement.
+    float w[32];
     float sum = 0.0f;
     for (uint i = 0; i < 6; ++i) {
-        const int eid = tid2eid[uint64_t(row) * 6ull + i];
-        const float s = v4cg_sqrtsoftplus(logits[uint64_t(row) * 256ull + uint(eid)]);
-        scores[i] = s;
-        sum += s;
+        const float s = rowLogits[rowIDs[i]];
+        const float sp = s > 20.0f ? s : fast::log(1.0f + fast::exp(s));
+        w[i] = fast::sqrt(max(sp, 0.0f));
+        sum += w[i];
     }
-    const float inv = (sum > 0.0f) ? (routeScale / sum) : 0.0f;
     for (uint i = 0; i < 6; ++i) {
-        outWeights[uint64_t(row) * 6ull + i] = scores[i] * inv;
+        rowWeights[i] = w[i] / sum * routeScale;
     }
 }
 

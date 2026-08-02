@@ -65,12 +65,15 @@ import TurboFieldfareValidationSupport
         return acc
     }
 
-    /// Full pipeline reference with the kernel's half stores reproduced
-    /// (acts, partials, h2 all round through Float16).
+    /// Full pipeline reference with the kernel's stores reproduced: acts and
+    /// h2 round through Float16, while each routing-weighted down-projection
+    /// rounds through Float32 before the six-route reduction adds the shared
+    /// expert residual.
     private static func reference(pairs: [PrefillTokenExpertPair],
                                   experts: [ExpertFixture],
                                   hidden: [[Float]],
                                   weights: [Float],
+                                  residual: [[Float]]? = nil,
                                   d: Int,
                                   f: Int) -> [Float] {
         let t = hidden.count
@@ -103,7 +106,7 @@ import TurboFieldfareValidationSupport
                 var down = [Float](repeating: 0, count: d)
                 for dd in 0..<d {
                     let value = dotFP4Row(expert.downs[dd], acts, n: f)
-                    down[dd] = Float(Float16(value))
+                    down[dd] = value
                 }
                 downCache[key] = down
                 partials.replaceSubrange(base..<(base + d), with: down)
@@ -112,10 +115,11 @@ import TurboFieldfareValidationSupport
         var h2 = [Float](repeating: 0, count: t * d)
         for token in 0..<t {
             for dd in 0..<d {
-                var acc: Float = 0
+                var acc = residual?[token][dd] ?? 0
                 for r in 0..<Self.topK {
-                    acc += weights[token * Self.topK + r]
+                    let weighted = weights[token * Self.topK + r]
                         * partials[(token * Self.topK + r) * d + dd]
+                    acc += weighted
                 }
                 h2[token * d + dd] = Float(Float16(acc))
             }
@@ -240,6 +244,7 @@ import TurboFieldfareValidationSupport
                             pairs: [PrefillTokenExpertPair],
                             hidden: [[Float]],
                             weights: [Float],
+                            residual: [[Float]]? = nil,
                             numExperts: Int,
                             d: Int,
                             f: Int,
@@ -276,10 +281,16 @@ import TurboFieldfareValidationSupport
                 length: routes.sortedPairs.count * MemoryLayout<PrefillTokenExpertPair>.stride,
                 options: .storageModeShared),
               let hiddenBuffer = Fp16Buffer.make(ctx.device, values: hidden.flatMap { $0 }),
-              let partialsBuffer = Fp16Buffer.make(ctx.device, count: t * Self.topK * d),
+              let partialsBuffer = ctx.device.makeBuffer(
+                length: t * Self.topK * d * MemoryLayout<Float>.stride,
+                options: .storageModeShared),
               let actsBuffer = Fp16Buffer.make(ctx.device,
                                                count: pairMicrobatchRows * f),
               let h2Buffer = Fp16Buffer.make(ctx.device, count: t * d),
+              let residualBuffer = Fp16Buffer.make(
+                ctx.device,
+                values: (residual ?? Array(
+                    repeating: Array(repeating: 0, count: d), count: t)).flatMap { $0 }),
               let weightsBuffer = ctx.device.makeBuffer(
                 bytes: weights,
                 length: weights.count * MemoryLayout<Float>.stride,
@@ -317,6 +328,7 @@ import TurboFieldfareValidationSupport
                 sortedPairs: pairBuffer,
                 acts: actsBuffer,
                 routePartials: partialsBuffer,
+                routeWeights: weightsBuffer,
                 argumentBuffer: argumentBuffer,
                 binding: binding,
                 params: params,
@@ -335,7 +347,7 @@ import TurboFieldfareValidationSupport
         }
         driver.encodeReduceTokenMajor(commandBuffer: reduceCmd,
                                       routePartials: partialsBuffer,
-                                      routeWeights: weightsBuffer,
+                                      residual: residualBuffer,
                                       h2: h2Buffer,
                                       queryCount: UInt32(t),
                                       topK: UInt32(Self.topK),
@@ -378,6 +390,30 @@ import TurboFieldfareValidationSupport
                                       d: d, f: f)
         let rel = RelError.compute(actual: result.h2, reference: expected)
         #expect(rel < Tolerance.fp16ChainedReduction, "single expert rel=\(rel)")
+    }
+
+    /// The production runner supplies the shared expert as the phase-2
+    /// residual. It must join the F32 routed sum before the one final half
+    /// store, matching the decode kernel rather than a separate fp16 add.
+    @Test func sharedResidualIsFusedBeforeFinalHalfStore() throws {
+        let d = Self.dimension
+        let f = Self.intermediate
+        let pool = Self.makePool(numExperts: 8, seed: 0x631, d: d, f: f)
+        let pairs = Self.makePairs(assignments: [[1, 2, 3, 4, 5, 6]])
+        let hidden = Self.makeHidden(seed: 0x632, tokens: 1, d: d)
+        let weights = Self.makeWeights(seed: 0x633, tokens: 1)
+        let residual = [(0..<d).map { index in
+            Float(Float16(Float((index % 13) - 6) * 0.03125))
+        }]
+
+        let result = try Self.run(pool: pool, pairs: pairs, hidden: hidden,
+                                  weights: weights, residual: residual,
+                                  numExperts: 8, d: d, f: f)
+        let expected = Self.reference(pairs: pairs, experts: pool,
+                                      hidden: hidden, weights: weights,
+                                      residual: residual, d: d, f: f)
+        let rel = RelError.compute(actual: result.h2, reference: expected)
+        #expect(rel < Tolerance.fp16ChainedReduction, "fused residual rel=\(rel)")
     }
 
     /// Five tokens over 12 live experts with uneven per-expert pair counts

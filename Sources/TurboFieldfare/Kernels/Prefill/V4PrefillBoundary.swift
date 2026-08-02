@@ -29,6 +29,8 @@ final class V4PrefillBoundary: @unchecked Sendable {
     private let prePSO: MTLComputePipelineState
     private let postPSO: MTLComputePipelineState
     private let rmsnormPSO: MTLComputePipelineState
+    private let rmsnormSerialOrderPSO: MTLComputePipelineState
+    private let rmsnormF16PSO: MTLComputePipelineState
     private let ropePSO: MTLComputePipelineState
 
     /// Scratch holding the latest `encodeParams` output, [maxRows, 24] fp32
@@ -92,6 +94,11 @@ final class V4PrefillBoundary: @unchecked Sendable {
                                          name: "v4pf_hc_post")
         self.rmsnormPSO = try Self.pipeline(device: device, library: library,
                                             name: "v4pf_rmsnorm_f32f16")
+        self.rmsnormSerialOrderPSO = try Self.pipeline(
+            device: device, library: library,
+            name: "v4pf_rmsnorm_f32f16_serial_order")
+        self.rmsnormF16PSO = try Self.pipeline(device: device, library: library,
+                                               name: "v4pf_rmsnorm_f16f16")
         self.ropePSO = try Self.pipeline(device: device, library: library,
                                          name: "v4pf_rope_trailing")
         guard let params = device.makeBuffer(
@@ -203,6 +210,59 @@ final class V4PrefillBoundary: @unchecked Sendable {
         precondition(rows > 0)
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(rmsnormPSO)
+        enc.setBuffer(x, offset: xOffset, index: 0)
+        enc.setBuffer(gamma, offset: gammaOffset, index: 1)
+        enc.setBuffer(out, offset: outOffset, index: 2)
+        var nn = UInt32(n)
+        var e = eps
+        var ug = UInt32(useGamma ? 1 : 0)
+        enc.setBytes(&nn, length: 4, index: 3)
+        enc.setBytes(&e, length: 4, index: 4)
+        enc.setBytes(&ug, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Batched FP32-input RMSNorm with the decode kernel's exact reduction and
+    /// multiplication order. Use this for runtime prefill parity. The generic
+    /// method above remains useful for optional gamma-free validation paths.
+    func encodeRMSNormSerialOrder(commandBuffer cb: MTLCommandBuffer,
+                                  x: MTLBuffer, xOffset: Int = 0,
+                                  gamma: MTLBuffer, gammaOffset: Int = 0,
+                                  out: MTLBuffer, outOffset: Int = 0,
+                                  rows: Int,
+                                  n: Int,
+                                  eps: Float = 1e-6) {
+        precondition(rows > 0)
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(rmsnormSerialOrderPSO)
+        enc.setBuffer(x, offset: xOffset, index: 0)
+        enc.setBuffer(gamma, offset: gammaOffset, index: 1)
+        enc.setBuffer(out, offset: outOffset, index: 2)
+        var nn = UInt32(n)
+        var e = eps
+        enc.setBytes(&nn, length: 4, index: 3)
+        enc.setBytes(&e, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Batched decode-parity RMSNorm, fp16 input/output with one 256-thread
+    /// threadgroup per row. `out` may alias `x` when both use the same row
+    /// stride, matching `v4b_rmsnorm`.
+    func encodeRMSNormF16(commandBuffer cb: MTLCommandBuffer,
+                          x: MTLBuffer, xOffset: Int = 0,
+                          gamma: MTLBuffer, gammaOffset: Int = 0,
+                          out: MTLBuffer, outOffset: Int = 0,
+                          rows: Int,
+                          n: Int,
+                          eps: Float = 1e-6,
+                          useGamma: Bool = true) {
+        precondition(rows > 0)
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(rmsnormF16PSO)
         enc.setBuffer(x, offset: xOffset, index: 0)
         enc.setBuffer(gamma, offset: gammaOffset, index: 1)
         enc.setBuffer(out, offset: outOffset, index: 2)

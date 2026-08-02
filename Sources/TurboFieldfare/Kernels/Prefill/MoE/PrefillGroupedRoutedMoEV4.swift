@@ -19,11 +19,12 @@ private enum PrefillMoEV4BufferIndex {
         static let acts = 2
         static let routedBlobs = 3
         static let params = 4
+        static let routeWeights = 5
     }
-    // Token-major F32-weighted reduce.
+    // Token-major reduce of pre-weighted F32 route partials.
     enum Reduce {
         static let routePartials = 0
-        static let routeWeights = 1
+        static let residual = 1
         static let h2 = 2
         static let t = 3
         static let topK = 4
@@ -111,9 +112,9 @@ struct PrefillMoEV4StreamedTileArgumentBuffer {
 ///   * Phase 1 and the down projection run one SIMD group per (pair, row)
 ///     with the decode kernel's 8-group block structure, instead of one
 ///     thread per output element.
-///   * The down scatter is unweighted; routing weights are applied in
-///     `encodeReduceTokenMajor` from an F32 `[T * topK]` buffer (the V4
-///     router emits F32 weights, so no half round-trip).
+    ///   * The down scatter applies the F32 route weight and stores an F32
+    ///     weighted partial. This mirrors decode's threadgroup partial store
+    ///     before the six-route sum, including its exact rounding boundary.
 ///
 /// Grouping itself is format-agnostic and shared: call
 /// `PrefillMoEGrouping.groupTokenExpertPairs(..., tileExpertCount: 8)` (or
@@ -225,6 +226,8 @@ final class PrefillGroupedRoutedMoEV4 {
                             actsOffset: Int = 0,
                             routePartials: MTLBuffer,
                             routePartialsOffset: Int = 0,
+                            routeWeights: MTLBuffer,
+                            routeWeightsOffset: Int = 0,
                             argumentBuffer: PrefillMoEV4StreamedTileArgumentBuffer,
                             binding: PrefillStreamedTileBinding,
                             params: PrefillGroupedRoutedMoEV4StreamedParams,
@@ -274,6 +277,8 @@ final class PrefillGroupedRoutedMoEV4 {
                 enc.setBytes(&p,
                              length: MemoryLayout<PrefillGroupedRoutedMoEV4StreamedParams>.stride,
                              index: PrefillMoEV4BufferIndex.Down.params)
+                enc.setBuffer(routeWeights, offset: routeWeightsOffset,
+                              index: PrefillMoEV4BufferIndex.Down.routeWeights)
                 for view in binding.views {
                     enc.useResource(view.buffer, usage: .read)
                 }
@@ -292,13 +297,15 @@ final class PrefillGroupedRoutedMoEV4 {
 
     /// Token-major routing-weighted reduce over all tiles' partials. Encode
     /// once per layer after every tile command buffer has drained.
-    /// `routeWeights` is the router's F32 `[queryCount * topK]` output;
-    /// `h2` receives `[queryCount * D]` half.
+    /// `routePartials` contains F32 routing-weighted down projections, each
+    /// rounded at the down-scatter store exactly as decode rounds its
+    /// threadgroup partial. `residual` is the shared expert half output; `h2`
+    /// receives their fused `[queryCount * D]` half result.
     func encodeReduceTokenMajor(commandBuffer: MTLCommandBuffer,
                                 routePartials: MTLBuffer,
                                 routePartialsOffset: Int = 0,
-                                routeWeights: MTLBuffer,
-                                routeWeightsOffset: Int = 0,
+                                residual: MTLBuffer,
+                                residualOffset: Int = 0,
                                 h2: MTLBuffer,
                                 h2Offset: Int = 0,
                                 queryCount: UInt32,
@@ -311,8 +318,8 @@ final class PrefillGroupedRoutedMoEV4 {
         enc.setComputePipelineState(reducePSO)
         enc.setBuffer(routePartials, offset: routePartialsOffset,
                       index: PrefillMoEV4BufferIndex.Reduce.routePartials)
-        enc.setBuffer(routeWeights, offset: routeWeightsOffset,
-                      index: PrefillMoEV4BufferIndex.Reduce.routeWeights)
+        enc.setBuffer(residual, offset: residualOffset,
+                      index: PrefillMoEV4BufferIndex.Reduce.residual)
         enc.setBuffer(h2, offset: h2Offset, index: PrefillMoEV4BufferIndex.Reduce.h2)
         var tVar = queryCount
         var topKVar = topK

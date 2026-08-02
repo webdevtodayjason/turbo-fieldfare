@@ -48,10 +48,10 @@ final class V4BatchedQKVCompressorPrefillStage {
 
     private let maxRows: Int
     private let proj: V4PrefillProj
+    private let serialGlue: V4ChunkedPrefillGlue
     private let boundary: V4PrefillBoundary
     private let epilogue: V4QKVEpilogue
     private let qr: MTLBuffer
-    private let windowKVFloat: MTLBuffer
     private let positions: MTLBuffer
     private let repeatedHeadPositions: MTLBuffer
 
@@ -59,16 +59,14 @@ final class V4BatchedQKVCompressorPrefillStage {
         precondition(maxRows > 0)
         self.maxRows = maxRows
         self.proj = try V4PrefillProj(device: device)
+        self.serialGlue = try V4ChunkedPrefillGlue(device: device)
         self.boundary = try V4PrefillBoundary(device: device, maxRows: maxRows * Self.numQHeads)
         self.epilogue = try V4QKVEpilogue(device: device)
-        // q_a and window_wkv GEMMs produce fp32 rows. RMSNorm then packs the
-        // normalized fp16 rows into the start of these scratch buffers before
-        // the next projection consumes them.
-        guard let qr = device.makeBuffer(length: maxRows * Self.qLoraRank * MemoryLayout<Float>.stride,
+        // Decode stores q_a/window_wkv projections as fp16 before RMSNorm.
+        // Keep the same quantization point and fp16 row stride for strict
+        // parity. Packing half rows into fp32 scratch aliases later rows.
+        guard let qr = device.makeBuffer(length: maxRows * Self.qLoraRank * MemoryLayout<Float16>.stride,
                                          options: .storageModeShared),
-              let windowKVFloat = device.makeBuffer(
-                length: maxRows * Self.headDim * MemoryLayout<Float>.stride,
-                options: .storageModeShared),
               let positions = device.makeBuffer(length: maxRows * MemoryLayout<Float>.stride,
                                                 options: .storageModeShared),
               let repeated = device.makeBuffer(length: maxRows * Self.numQHeads * MemoryLayout<Float>.stride,
@@ -76,11 +74,9 @@ final class V4BatchedQKVCompressorPrefillStage {
             throw MetalError.noDevice
         }
         qr.label = "v4batched-qkv.qr"
-        windowKVFloat.label = "v4batched-qkv.windowKVFloat"
         positions.label = "v4batched-qkv.positions"
         repeated.label = "v4batched-qkv.repeatedHeadPositions"
         self.qr = qr
-        self.windowKVFloat = windowKVFloat
         self.positions = positions
         self.repeatedHeadPositions = repeated
     }
@@ -113,11 +109,12 @@ final class V4BatchedQKVCompressorPrefillStage {
                            scales: weights.wqA.scales, scalesOffset: weights.wqAScalesOffset,
                            x: hiddenRows, xOffset: hiddenRowsOffset,
                            out: qr, rows: rowCount, m: Self.qLoraRank, n: Self.dim,
-                           outFP16: false)
-        boundary.encodeRMSNorm(commandBuffer: cb,
-                               x: qr, gamma: weights.qNormGamma, gammaOffset: weights.qNormGammaOffset,
-                               out: qr, rows: rowCount, n: Self.qLoraRank,
-                               eps: normEps, useGamma: true)
+                           outFP16: true)
+        boundary.encodeRMSNormF16(commandBuffer: cb,
+                                  x: qr, gamma: weights.qNormGamma,
+                                  gammaOffset: weights.qNormGammaOffset,
+                                  out: qr, rows: rowCount, n: Self.qLoraRank,
+                                  eps: normEps, useGamma: true)
 
         proj.encodeFP8GEMM(commandBuffer: cb,
                            weights: weights.wqB.codes, weightsOffset: weights.wqBCodesOffset,
@@ -142,15 +139,19 @@ final class V4BatchedQKVCompressorPrefillStage {
                            weights: weights.windowWKV.codes, weightsOffset: weights.windowWKVCodesOffset,
                            scales: weights.windowWKV.scales, scalesOffset: weights.windowWKVScalesOffset,
                            x: hiddenRows, xOffset: hiddenRowsOffset,
-                           out: windowKVFloat,
+                           out: outputs.windowKVOut,
+                           outOffset: outputs.windowKVOutOffset,
                            rows: rowCount, m: Self.headDim, n: Self.dim,
-                           outFP16: false)
-        boundary.encodeRMSNorm(commandBuffer: cb,
-                               x: windowKVFloat,
-                               gamma: weights.kvNormGamma, gammaOffset: weights.kvNormGammaOffset,
-                               out: outputs.windowKVOut, outOffset: outputs.windowKVOutOffset,
-                               rows: rowCount, n: Self.headDim,
-                               eps: normEps, useGamma: true)
+                           outFP16: true)
+        boundary.encodeRMSNormF16(commandBuffer: cb,
+                                  x: outputs.windowKVOut,
+                                  xOffset: outputs.windowKVOutOffset,
+                                  gamma: weights.kvNormGamma,
+                                  gammaOffset: weights.kvNormGammaOffset,
+                                  out: outputs.windowKVOut,
+                                  outOffset: outputs.windowKVOutOffset,
+                                  rows: rowCount, n: Self.headDim,
+                                  eps: normEps, useGamma: true)
         boundary.encodeRoPE(commandBuffer: cb,
                             x: outputs.windowKVOut, xOffset: outputs.windowKVOutOffset,
                             positions: positions,
@@ -162,18 +163,18 @@ final class V4BatchedQKVCompressorPrefillStage {
 
         if let wkv = weights.compressorWKV, let wgate = weights.compressorWGate,
            let wkvOut = outputs.compressorWKVOut, let wgateOut = outputs.compressorWGateOut {
-            proj.encodeBF16GEMM(commandBuffer: cb,
-                                weights: wkv, weightsOffset: weights.compressorWKVOffset,
-                                x: hiddenRows, xOffset: hiddenRowsOffset,
-                                out: wkvOut, outOffset: outputs.compressorWKVOutOffset,
-                                rows: rowCount, m: weights.compressorOutDim, n: Self.dim,
-                                outFP16: false)
-            proj.encodeBF16GEMM(commandBuffer: cb,
-                                weights: wgate, weightsOffset: weights.compressorWGateOffset,
-                                x: hiddenRows, xOffset: hiddenRowsOffset,
-                                out: wgateOut, outOffset: outputs.compressorWGateOutOffset,
-                                rows: rowCount, m: weights.compressorOutDim, n: Self.dim,
-                                outFP16: false)
+            serialGlue.encodeBF16GEMMSerialOrder(
+                commandBuffer: cb,
+                weights: wkv, weightsOffset: weights.compressorWKVOffset,
+                hidden: hiddenRows, hiddenOffset: hiddenRowsOffset,
+                output: wkvOut, outputOffset: outputs.compressorWKVOutOffset,
+                rows: rowCount, outputRows: weights.compressorOutDim, dim: Self.dim)
+            serialGlue.encodeBF16GEMMSerialOrder(
+                commandBuffer: cb,
+                weights: wgate, weightsOffset: weights.compressorWGateOffset,
+                hidden: hiddenRows, hiddenOffset: hiddenRowsOffset,
+                output: wgateOut, outputOffset: outputs.compressorWGateOutOffset,
+                rows: rowCount, outputRows: weights.compressorOutDim, dim: Self.dim)
         }
 
         if let indexer = weights.indexerWqB, let indexQOut = outputs.indexQOut {

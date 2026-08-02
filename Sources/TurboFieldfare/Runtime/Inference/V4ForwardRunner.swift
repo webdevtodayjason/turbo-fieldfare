@@ -268,8 +268,8 @@ public final class V4ForwardRunner {
                                 position: position)
             if kind != .passthrough,
                cache.completesGroup(layer: layer, tokenPosition: position) {
-                flushGroup(commandBuffer: cb1, layer: layer, kind: kind,
-                           position: position, ropeCfg: ropeCfg)
+                try flushGroup(commandBuffer: cb1, layer: layer, kind: kind,
+                               position: position, ropeCfg: ropeCfg)
             }
             try encodeAttention(commandBuffer: cb1, layer: layer, kind: kind,
                                 tokenCount: tokenCount, ropeCfg: ropeCfg)
@@ -628,7 +628,7 @@ public final class V4ForwardRunner {
                                  rows: rows, dim: dim)
         let attnNorm = try gammaF32(model.attnNorm(layer: layer),
                                     name: "layers.\(layer).attn_norm")
-        state.boundary.encodeRMSNorm(commandBuffer: cb,
+        state.boundary.encodeRMSNormSerialOrder(commandBuffer: cb,
                                      x: state.branch,
                                      gamma: attnNorm,
                                      out: state.xNorm,
@@ -655,31 +655,29 @@ public final class V4ForwardRunner {
         if kind == .csa {
             qkvOutputs.indexQOut = state.indexQ
             let indexWeightsProjection = try model.indexerWeightsProj(layer: layer)
-            state.proj.encodeBF16GEMM(commandBuffer: cb,
-                                      weights: indexWeightsProjection.buffer,
-                                      weightsOffset: Int(indexWeightsProjection.offset),
-                                      x: state.xNorm,
-                                      out: state.indexWeights,
-                                      rows: rows,
-                                      m: model.config.indexNHeads,
-                                      n: dim,
-                                      outFP16: false)
+            state.glue.encodeBF16GEMMSerialOrder(
+                commandBuffer: cb,
+                weights: indexWeightsProjection.buffer,
+                weightsOffset: Int(indexWeightsProjection.offset),
+                hidden: state.xNorm,
+                output: state.indexWeights,
+                rows: rows,
+                outputRows: model.config.indexNHeads,
+                dim: dim)
             let indexerWKV = try model.indexerCompressorWKV(layer: layer)
             let indexerWGate = try model.indexerCompressorWGate(layer: layer)
-            state.proj.encodeBF16GEMM(commandBuffer: cb,
-                                      weights: indexerWKV.buffer,
-                                      weightsOffset: Int(indexerWKV.offset),
-                                      x: state.xNorm,
-                                      out: state.indexerCompressorKV,
-                                      rows: rows, m: 256, n: dim,
-                                      outFP16: false)
-            state.proj.encodeBF16GEMM(commandBuffer: cb,
-                                      weights: indexerWGate.buffer,
-                                      weightsOffset: Int(indexerWGate.offset),
-                                      x: state.xNorm,
-                                      out: state.indexerCompressorGate,
-                                      rows: rows, m: 256, n: dim,
-                                      outFP16: false)
+            state.glue.encodeBF16GEMMSerialOrder(
+                commandBuffer: cb,
+                weights: indexerWKV.buffer, weightsOffset: Int(indexerWKV.offset),
+                hidden: state.xNorm,
+                output: state.indexerCompressorKV,
+                rows: rows, outputRows: 256, dim: dim)
+            state.glue.encodeBF16GEMMSerialOrder(
+                commandBuffer: cb,
+                weights: indexerWGate.buffer, weightsOffset: Int(indexerWGate.offset),
+                hidden: state.xNorm,
+                output: state.indexerCompressorGate,
+                rows: rows, outputRows: 256, dim: dim)
         }
         state.qkvStage.encode(commandBuffer: cb,
                               hiddenRows: state.xNorm,
@@ -782,20 +780,21 @@ public final class V4ForwardRunner {
                                  rows: rows, dim: dim)
         let ffnNorm = try gammaF32(model.ffnNorm(layer: layer),
                                    name: "layers.\(layer).ffn_norm")
-        state.boundary.encodeRMSNorm(commandBuffer: cb,
+        state.boundary.encodeRMSNormSerialOrder(commandBuffer: cb,
                                      x: state.branch,
                                      gamma: ffnNorm,
                                      out: state.xNorm,
                                      rows: rows, n: dim, eps: eps)
 
         let router = try model.routerWeight(layer: layer)
-        state.proj.encodeBF16GEMM(commandBuffer: cb,
-                                  weights: router.buffer,
-                                  weightsOffset: Int(router.offset),
-                                  x: state.xNorm,
-                                  out: state.routerLogits,
-                                  rows: rows, m: numExperts, n: dim,
-                                  outFP16: false)
+        state.glue.encodeBF16GEMMSerialOrder(commandBuffer: cb,
+                                             weights: router.buffer,
+                                             weightsOffset: Int(router.offset),
+                                             hidden: state.xNorm,
+                                             output: state.routerLogits,
+                                             rows: rows,
+                                             outputRows: numExperts,
+                                             dim: dim)
         let hashRouted = model.config.isHashRouted(layer: layer)
         let tokenIDs = tokens.map { UInt32(bitPattern: $0) }
         var hashExpertIDs: [UInt32] = []
@@ -808,22 +807,27 @@ public final class V4ForwardRunner {
             state.uploadTokenIDs(tokenIDs)
             let routePointer = state.routeIDs.contents().assumingMemoryBound(to: UInt32.self)
             for (index, expert) in hashExpertIDs.enumerated() { routePointer[index] = expert }
-            state.glue.encodeHashRouterWeights(commandBuffer: cb,
-                                                logits: state.routerLogits,
-                                                tid2eid: state.routeIDs,
-                                                outWeights: state.routeWeights,
-                                                rows: rows,
-                                                routeScale: routeScale)
+            glue.encodeRouterWeightsAtIndicesBatchedSerial(
+                commandBuffer: cb,
+                logits: state.routerLogits,
+                indices: state.routeIDs,
+                outWeights: state.routeWeights,
+                rows: rows,
+                expertCount: numExperts,
+                k: UInt32(topK),
+                routeScale: routeScale)
         } else {
             let bias = try model.routerBias(layer: layer)
-            state.glue.encodeRouterTop6(commandBuffer: cb,
-                                        logits: state.routerLogits,
-                                        staticBias: bias.buffer,
-                                        staticBiasOffset: Int(bias.offset),
-                                        outIDs: state.routeIDs,
-                                        outWeights: state.routeWeights,
-                                        rows: rows,
-                                        routeScale: routeScale)
+            moe.encodeRouterSelectV4BatchedSerial(
+                commandBuffer: cb,
+                logits: state.routerLogits,
+                bias: bias.buffer,
+                biasOffset: Int(bias.offset),
+                outIndices: state.routeIDs,
+                outWeights: state.routeWeights,
+                rows: rows,
+                numExperts: UInt32(numExperts),
+                routeScale: routeScale)
         }
 
         try encodePrefillSharedExpert(commandBuffer: cb,
@@ -857,6 +861,7 @@ public final class V4ForwardRunner {
             hidden: state.xNorm,
             pairs: pairs,
             routeWeights: state.routeWeights,
+            residual: state.sharedOut,
             layer: layer,
             queryCount: rows,
             numExperts: numExperts,
@@ -865,14 +870,9 @@ public final class V4ForwardRunner {
             hiddenStrideElements: dim)
 
         guard let postCB = queue.makeCommandBuffer() else { throw MetalError.noQueue }
-        state.glue.encodeAddF16(commandBuffer: postCB,
-                                a: routed.output,
-                                b: state.sharedOut,
-                                out: state.routedPlusShared,
-                                count: rows * dim)
         state.boundary.encodePost(commandBuffer: postCB,
                                   residual: state.stream,
-                                  sublayer: state.routedPlusShared,
+                                  sublayer: routed.output,
                                   out: state.stream,
                                   rows: rows, dim: dim)
         postCB.commit()
@@ -1052,19 +1052,23 @@ public final class V4ForwardRunner {
     /// accumulators into the previous-group slots for the overlap.
     private func flushGroup(commandBuffer cb: MTLCommandBuffer,
                             layer: Int, kind: V4LayerKind, position: Int,
-                            ropeCfg: V4RoPE.Config) {
+                            ropeCfg: V4RoPE.Config) throws {
         let group = cache.groupIndex(layer: layer, tokenPosition: position)
         let slot = cache.compressedSlot(layer: layer, group: group)
         let ropePos = UInt32(cache.ropePosition(layer: layer, group: group))
         switch kind {
         case .csa:
             let state = compressorAccumulators.csa(layer: layer)
+            let ape = try model.compressorAPE(layer: layer)
+            let gamma = try model.compressorNorm(layer: layer)
+            let indexerAPE = try model.indexerCompressorAPE(layer: layer)
+            let indexerGamma = try model.indexerCompressorNorm(layer: layer)
             attention.encodeCSACompressGroup(
                 commandBuffer: cb,
                 prevKV: state.prevKV, curKV: state.curKV,
                 prevGate: state.prevGate, curGate: state.curGate,
-                ape: (try? model.compressorAPE(layer: layer))?.buffer ?? rowScratch,
-                gamma: (try? model.compressorNorm(layer: layer))?.buffer ?? rowScratch,
+                ape: ape.buffer, apeOffset: Int(ape.offset),
+                gamma: gamma.buffer, gammaOffset: Int(gamma.offset),
                 outValues: slot.values.buffer, valuesOffset: slot.values.offset,
                 outScales: slot.scales.buffer, scalesOffset: slot.scales.offset,
                 outRope: slot.rope.buffer, ropeOffset: slot.rope.offset,
@@ -1080,8 +1084,8 @@ public final class V4ForwardRunner {
                 commandBuffer: cb,
                 prevKV: state.idxPrevKV, curKV: state.idxCurKV,
                 prevGate: state.idxPrevGate, curGate: state.idxCurGate,
-                ape: (try? model.indexerCompressorAPE(layer: layer))?.buffer ?? rowScratch,
-                gamma: (try? model.indexerCompressorNorm(layer: layer))?.buffer ?? rowScratch,
+                ape: indexerAPE.buffer, apeOffset: Int(indexerAPE.offset),
+                gamma: indexerGamma.buffer, gammaOffset: Int(indexerGamma.offset),
                 out: idxSlot.buffer, outOffset: idxSlot.offset,
                 ropePosition: ropePos, rope: ropeCfg, normEps: eps)
             // Roll: the current group becomes the previous group for the
@@ -1089,10 +1093,12 @@ public final class V4ForwardRunner {
             compressorAccumulators.rollCSA(commandBuffer: cb, layer: layer)
         case .hca:
             let state = compressorAccumulators.hca(layer: layer)
+            let ape = try model.compressorAPE(layer: layer)
+            let gamma = try model.compressorNorm(layer: layer)
             hca.encodeGroup(commandBuffer: cb,
                             kv: state.ringKV, gate: state.ringGate,
-                            ape: (try? model.compressorAPE(layer: layer))?.buffer ?? rowScratch,
-                            gamma: (try? model.compressorNorm(layer: layer))?.buffer ?? rowScratch,
+                            ape: ape.buffer, apeOffset: Int(ape.offset),
+                            gamma: gamma.buffer, gammaOffset: Int(gamma.offset),
                             outValues: slot.values.buffer, valuesOffset: slot.values.offset,
                             outScales: slot.scales.buffer, scalesOffset: slot.scales.offset,
                             outRope: slot.rope.buffer, ropeOffset: slot.rope.offset,

@@ -54,6 +54,92 @@ import TurboFieldfareValidationSupport
         #expect(out[0] < out[2 * Self.heads * Self.dim])
     }
 
+    @Test func passthroughTwoChunks_wrappedWindowMatchesSerialDecodeBitExactly() throws {
+        let total = 131
+        let split = 128
+        let ctx = try MetalContext()
+        let config = V4CacheConfig(compressRatios: [0])
+        let serialCache = try CompressedKVCacheManager(device: ctx.device,
+                                                       config: config,
+                                                       maxContext: 256)
+        let serialAttention = try V4Attention(device: ctx.device, maxContext: 256)
+        let chunkCache = try CompressedKVCacheManager(device: ctx.device,
+                                                      config: config,
+                                                      maxContext: 256)
+        let chunkAttention = try V4Attention(device: ctx.device, maxContext: 256)
+        let executor = try V4ChunkedPrefillExecutor(device: ctx.device,
+                                                    cache: chunkCache,
+                                                    attention: chunkAttention)
+        var rng = SeedTree(0xC002).key("wrapped-serial-parity")
+        let q = (0..<(total * Self.heads * Self.dim)).map { _ in
+            Float16(rng.uniform(-0.25, 0.25))
+        }
+        let kv = (0..<(total * Self.dim)).map { _ in
+            Float16(rng.uniform(-0.5, 0.5))
+        }
+        let sinks = (0..<Self.heads).map { _ in rng.uniform(-0.75, 0.75) }
+        guard let qBuffer = Fp16Buffer.make(ctx.device, halves: q),
+              let kvBuffer = Fp16Buffer.make(ctx.device, halves: kv),
+              let sinkBuffer = ctx.device.makeBuffer(bytes: sinks,
+                                                      length: sinks.count * MemoryLayout<Float>.stride,
+                                                      options: .storageModeShared),
+              let serialOut = Fp16Buffer.make(ctx.device, count: total * Self.heads * Self.dim),
+              let chunkOut = Fp16Buffer.make(ctx.device, count: total * Self.heads * Self.dim) else {
+            Issue.record("alloc failed"); return
+        }
+        let qStride = Self.heads * Self.dim * MemoryLayout<Float16>.stride
+        let kvStride = Self.dim * MemoryLayout<Float16>.stride
+
+        for position in 0..<total {
+            let cb = ctx.queue.makeCommandBuffer()!
+            let slot = serialCache.windowSlot(layer: 0, position: position)
+            let blit = cb.makeBlitCommandEncoder()
+            blit?.copy(from: kvBuffer, sourceOffset: position * kvStride,
+                       to: slot.buffer, destinationOffset: slot.offset,
+                       size: kvStride)
+            blit?.endEncoding()
+            serialAttention.encodeWindowMQADecode(
+                commandBuffer: cb,
+                q: qBuffer, qOffset: position * qStride,
+                windowK: serialCache.windowBuffer(layer: 0),
+                tokenCount: position + 1,
+                sinks: sinkBuffer,
+                out: serialOut, outOffset: position * qStride)
+            cb.commit(); cb.waitUntilCompleted()
+            serialCache.advance()
+        }
+
+        let first = V4ChunkedPrefillExecutor.Inputs(
+            q: qBuffer,
+            windowKV: kvBuffer,
+            sinks: sinkBuffer,
+            output: chunkOut)
+        let cb1 = ctx.queue.makeCommandBuffer()!
+        executor.encode(commandBuffer: cb1, layer: 0, startPosition: 0,
+                        rowCount: split, inputs: first)
+        cb1.commit(); cb1.waitUntilCompleted()
+        chunkCache.advance(by: split)
+
+        let second = V4ChunkedPrefillExecutor.Inputs(
+            q: qBuffer, qOffset: split * qStride,
+            windowKV: kvBuffer, windowKVOffset: split * kvStride,
+            sinks: sinkBuffer,
+            output: chunkOut, outputOffset: split * qStride)
+        let cb2 = ctx.queue.makeCommandBuffer()!
+        executor.encode(commandBuffer: cb2, layer: 0, startPosition: split,
+                        rowCount: total - split, inputs: second)
+        cb2.commit(); cb2.waitUntilCompleted()
+        chunkCache.advance(by: total - split)
+
+        let finalOffset = (total - 1) * Self.heads * Self.dim
+        let serialValues = Fp16Buffer.read(serialOut, count: total * Self.heads * Self.dim)
+        let chunkValues = Fp16Buffer.read(chunkOut, count: total * Self.heads * Self.dim)
+        let serialFinal = Array(serialValues[finalOffset..<(finalOffset + Self.heads * Self.dim)])
+        let chunkFinal = Array(chunkValues[finalOffset..<(finalOffset + Self.heads * Self.dim)])
+        #expect(chunkFinal == serialFinal,
+                "wrapped chunk executor attention must be bit-exact to serial decode")
+    }
+
     @Test func twoLayerExecutorsShareStartPosition_beforeExternalAdvance() throws {
         let rows = 3
         let ctx = try MetalContext()

@@ -316,6 +316,86 @@ void v4pf_rmsnorm_f32f16(
     }
 }
 
+// Batched, bit-exact mirror of decode `v4c_rmsnorm_f32in`. Keep the decode
+// kernel's constant 256-thread reduction geometry and expression order rather
+// than routing through the generic helper above. Small compiler differences in
+// the generic form can move a handful of FP16 outputs by one ULP, which then
+// changes the causal window history during long prompt prefill.
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void v4pf_rmsnorm_f32f16_serial_order(
+    device const float* x     [[buffer(0)]],   // [rows, n] fp32
+    device const float* gamma [[buffer(1)]],   // [n] fp32
+    device half* out          [[buffer(2)]],   // [rows, n] fp16
+    constant uint& n          [[buffer(3)]],
+    constant float& eps       [[buffer(4)]],
+    uint row                  [[threadgroup_position_in_grid]],
+    uint lid                  [[thread_position_in_threadgroup]],
+    uint simd_lane_id         [[thread_index_in_simdgroup]],
+    uint simd_group_id        [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float reduce_scratch[8];
+    threadgroup float bcast;
+    device const float* xr = x + uint64_t(row) * n;
+    device half* yr = out + uint64_t(row) * n;
+
+    float sq = 0.0f;
+    for (uint i = lid; i < n; i += 256u) {
+        const float v = xr[i];
+        sq = fma(v, v, sq);
+    }
+    sq = simd_sum(sq);
+    if (simd_lane_id == 0u) { reduce_scratch[simd_group_id] = sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0u) {
+        float t = (simd_lane_id < 8u) ? reduce_scratch[simd_lane_id] : 0.0f;
+        t = simd_sum(t);
+        if (simd_lane_id == 0u) { bcast = rsqrt(t / float(n) + eps); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rstd = bcast;
+    for (uint i = lid; i < n; i += 256u) {
+        yr[i] = half(xr[i] * rstd * gamma[i]);
+    }
+}
+
+// Batched mirror of decode `v4b_rmsnorm`: fp16 input/output with identical
+// 256-thread reduction geometry. This preserves the decode quantization point
+// after wq_a/window_wkv and is safe in place because each row keeps its fp16
+// stride (unlike packing half output into fp32 input storage).
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void v4pf_rmsnorm_f16f16(
+    device const half* x         [[buffer(0)]],   // [rows, n] fp16
+    device const float* gamma    [[buffer(1)]],   // [n] fp32
+    device half* y               [[buffer(2)]],   // [rows, n] fp16
+    constant uint& n             [[buffer(3)]],
+    constant float& eps          [[buffer(4)]],
+    constant uint& use_gamma     [[buffer(5)]],
+    uint tg_id                   [[threadgroup_position_in_grid]],
+    uint lid                     [[thread_position_in_threadgroup]],
+    uint lsize                   [[threads_per_threadgroup]],
+    uint simd_lane_id            [[thread_index_in_simdgroup]],
+    uint simd_group_id           [[simdgroup_index_in_threadgroup]],
+    uint simdgroups              [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float reduce_scratch[32];
+    threadgroup float bcast;
+    device const half* xr = x + uint64_t(tg_id) * n;
+    device half* yr = y + uint64_t(tg_id) * n;
+
+    float partial = 0.0f;
+    for (uint i = lid; i < n; i += lsize) {
+        const float v = float(xr[i]);
+        partial = fma(v, v, partial);
+    }
+    const float sq = v4pf_block_reduce_sum(partial, simd_lane_id, simd_group_id,
+                                           simdgroups, reduce_scratch, &bcast);
+    const float rs = rsqrt(sq / float(n) + eps);
+    for (uint i = lid; i < n; i += lsize) {
+        const float g = use_gamma != 0u ? gamma[i] : 1.0f;
+        yr[i] = half(float(xr[i]) * rs * g);
+    }
+}
+
 // ============================================================================
 // v4pf_rope_trailing — batched partial RoPE on the trailing rope_dim slice of
 // every row of X [rows, width] fp16, in place, with a PER-ROW position

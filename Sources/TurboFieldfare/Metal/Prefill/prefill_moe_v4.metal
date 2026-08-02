@@ -26,10 +26,11 @@ using namespace metal;
 //   phase1: for each sorted (token, expert) pair p and each f in [0, F):
 //       acts[p * F + f] = swiglu(gate_e[f] . x_token, up_e[f] . x_token)
 //   down:   for each pair p and each d in [0, D):
-//       route_partials[(token * top_k + rank) * D + d] = down_e[d] . acts[p]
+//       route_partials[(token * top_k + rank) * D + d]
+//           = route_weight[token, rank] * (down_e[d] . acts[p])
 //   reduce (once after ALL tiles drain): for each token t, d:
-//       h2[t * D + d] = sum_r route_weights[t * top_k + r]
-//                         * route_partials[(t * top_k + r) * D + d]
+//       h2[t * D + d] = residual[t * D + d]
+//                         + sum_r route_partials[(t * top_k + r) * D + d]
 // Pairs for one token may span tiles; the scatter into route_partials makes
 // cross-tile accumulation order irrelevant.
 //
@@ -308,10 +309,11 @@ kernel void prefill_moe_v4_grouped_phase1_gate_up_swiglu(
 // Unweighted: the F32 routing weights are applied in the token-major reduce.
 kernel void prefill_moe_v4_grouped_down_scatter(
     device const V4PMPair*         sorted_pairs   [[buffer(0)]],
-    device half*                   route_partials [[buffer(1)]],
+    device float*                  route_partials [[buffer(1)]],
     device const half*             acts           [[buffer(2)]],
     device const V4PMRoutedBlobs&  routed         [[buffer(3)]],
     constant V4PMStreamedParams&   p              [[buffer(4)]],
+    device const float*            route_weights  [[buffer(5)]],
     uint tg_idx [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane   [[thread_index_in_simdgroup]]
@@ -332,18 +334,24 @@ kernel void prefill_moe_v4_grouped_down_scatter(
 
     const float value = v4pm_fp4_row_dot(dW, dS, act, d, p.F, lane);
     if (lane == 0) {
-        route_partials[(uint(pair.token) * p.top_k + uint(pair.rank)) * p.D + d] = half(value);
+        const uint route = uint(pair.token) * p.top_k + uint(pair.rank);
+        // Decode writes this product to threadgroup float storage before the
+        // six-route sum. Preserve the same F32 rounding boundary by writing
+        // the weighted value to global float storage here.
+        route_partials[route * p.D + d] = route_weights[route] * value;
     }
 }
 
 // Token-major routing-weighted reduce, run once after every tile's down
-// scatter has drained. route_weights is F32 [T * top_k] straight from the
-// router (normalized sqrt-softplus scores x route_scale).
-//   h2[t * D + d] = sum_r route_weights[t * top_k + r]
-//                     * route_partials[(t * top_k + r) * D + d]
+// scatter has drained. Each route partial is already routing-weighted and
+// rounded to F32 by the down-scatter store, matching decode's threadgroup
+// partial store. The shared expert residual is added before the one final half
+// store, matching decode's fused phase-2 reduction.
+//   h2[t * D + d] = residual[t * D + d]
+//                   + sum_r route_partials[(t * top_k + r) * D + d]
 kernel void prefill_moe_v4_reduce_token_major(
-    device const half*  route_partials [[buffer(0)]],
-    device const float* route_weights  [[buffer(1)]],
+    device const float* route_partials [[buffer(0)]],
+    device const half*  residual       [[buffer(1)]],
     device half*        h2             [[buffer(2)]],
     constant uint&      T              [[buffer(3)]],
     constant uint&      top_k          [[buffer(4)]],
@@ -354,12 +362,10 @@ kernel void prefill_moe_v4_reduce_token_major(
     const uint t = gid.y;
     if (t >= T || d >= D) return;
 
-    float acc = 0.0f;
+    float acc = float(residual[t * D + d]);
     for (uint r = 0; r < top_k; ++r) {
         const uint partial_index = (t * top_k + r) * D + d;
-        acc = fma(route_weights[t * top_k + r],
-                  float(route_partials[partial_index]),
-                  acc);
+        acc += route_partials[partial_index];
     }
     h2[t * D + d] = half(acc);
 }
