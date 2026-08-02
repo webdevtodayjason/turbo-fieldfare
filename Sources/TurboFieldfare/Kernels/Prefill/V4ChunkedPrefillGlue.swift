@@ -16,6 +16,7 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
     private let embeddingPSO: MTLComputePipelineState
     private let topKPSO: MTLComputePipelineState
     private let hashWeightsPSO: MTLComputePipelineState
+    private let addF16PSO: MTLComputePipelineState
 
     init(device: MTLDevice) throws {
         self.embeddingPSO = try Self.pipeline(device: device,
@@ -24,6 +25,8 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
                                         name: "v4cg_router_top6_sqrtsoftplus")
         self.hashWeightsPSO = try Self.pipeline(device: device,
                                                name: "v4cg_hash_router_weights_sqrtsoftplus")
+        self.addF16PSO = try Self.pipeline(device: device,
+                                           name: "v4cg_add_f16")
     }
 
     private static func pipeline(device: MTLDevice, name: String) throws -> MTLComputePipelineState {
@@ -129,6 +132,27 @@ final class V4ChunkedPrefillGlue: @unchecked Sendable {
         enc.setBytes(&r, length: 4, index: 3)
         enc.setBytes(&scale, length: 4, index: 4)
         dispatch1D(enc, pso: hashWeightsPSO, threads: rows)
+        enc.endEncoding()
+    }
+
+    /// Elementwise fp16 addition: `out[i] = a[i] + b[i]` for `count` elements.
+    func encodeAddF16(commandBuffer cb: MTLCommandBuffer,
+                      a: MTLBuffer,
+                      aOffset: Int = 0,
+                      b: MTLBuffer,
+                      bOffset: Int = 0,
+                      out: MTLBuffer,
+                      outOffset: Int = 0,
+                      count: Int) {
+        precondition(count > 0)
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(addF16PSO)
+        enc.setBuffer(a, offset: aOffset, index: 0)
+        enc.setBuffer(b, offset: bOffset, index: 1)
+        enc.setBuffer(out, offset: outOffset, index: 2)
+        var n = UInt32(count)
+        enc.setBytes(&n, length: 4, index: 3)
+        dispatch1D(enc, pso: addF16PSO, threads: count)
         enc.endEncoding()
     }
 

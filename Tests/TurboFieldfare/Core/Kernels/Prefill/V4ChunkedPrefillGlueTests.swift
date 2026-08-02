@@ -40,6 +40,19 @@ import Metal
         return Array(UnsafeBufferPointer(start: base, count: count))
     }
 
+    static func makeF16(_ device: MTLDevice, _ values: [Float16]) -> MTLBuffer? {
+        values.withUnsafeBufferPointer { ptr in
+            device.makeBuffer(bytes: ptr.baseAddress!,
+                              length: values.count * MemoryLayout<Float16>.size,
+                              options: .storageModeShared)
+        }
+    }
+
+    static func readF16(_ buf: MTLBuffer, count: Int) -> [Float16] {
+        let base = buf.contents().bindMemory(to: Float16.self, capacity: count)
+        return Array(UnsafeBufferPointer(start: base, count: count))
+    }
+
     static func readI32(_ buf: MTLBuffer, count: Int) -> [Int32] {
         let base = buf.contents().bindMemory(to: Int32.self, capacity: count)
         return Array(UnsafeBufferPointer(start: base, count: count))
@@ -191,6 +204,32 @@ import Metal
                         "row=\(row) i=\(i) got=\(got[row * 6 + i]) ref=\(ref)")
             }
             #expect(abs(got[(row * 6)..<((row + 1) * 6)].reduce(0, +) - routeScale) < 1e-5)
+        }
+    }
+
+    @Test func addF16_addsElementwiseForArbitraryCount() throws {
+        let ctx = try MetalContext()
+        let glue = try V4ChunkedPrefillGlue(device: ctx.device)
+        let lhs = (0..<333).map { Float16(Float($0 % 17) * 0.25 - 2.0) }
+        let rhs = (0..<333).map { Float16(3.0 - Float($0 % 11) * 0.125) }
+        guard let lhsBuf = Self.makeF16(ctx.device, lhs),
+              let rhsBuf = Self.makeF16(ctx.device, rhs),
+              let outBuf = ctx.device.makeBuffer(length: lhs.count * MemoryLayout<Float16>.size,
+                                                 options: .storageModeShared) else {
+            Issue.record("alloc failed"); return
+        }
+
+        let cb = ctx.queue.makeCommandBuffer()!
+        glue.encodeAddF16(commandBuffer: cb,
+                          a: lhsBuf,
+                          b: rhsBuf,
+                          out: outBuf,
+                          count: lhs.count)
+        cb.commit(); cb.waitUntilCompleted()
+
+        let got = Self.readF16(outBuf, count: lhs.count)
+        for i in lhs.indices {
+            #expect(got[i] == lhs[i] + rhs[i], "i=\(i) got=\(got[i])")
         }
     }
 }

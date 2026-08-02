@@ -39,6 +39,26 @@ final class V4LogitProducer: LogitProducer, @unchecked Sendable {
     }
 }
 
+enum V4ChunkedPrefillEnvError: Error, CustomStringConvertible, Equatable {
+    case invalidChunkTokens(String)
+
+    var description: String {
+        switch self {
+        case .invalidChunkTokens(let value):
+            return "TURBO_V4_PREFILL_CHUNK_TOKENS must be one of 32, 64, or 128 when TURBO_V4_CHUNKED_PREFILL=1; got \"\(value)\""
+        }
+    }
+}
+
+func v4ChunkedPrefillConfigFromEnv(_ env: [String: String] = ProcessInfo.processInfo.environment) throws -> PrefillRuntimeConfig {
+    guard env["TURBO_V4_CHUNKED_PREFILL"] == "1" else { return .off }
+    let rawChunkTokens = env["TURBO_V4_PREFILL_CHUNK_TOKENS"] ?? "128"
+    guard let chunkTokens = Int(rawChunkTokens), [32, 64, 128].contains(chunkTokens) else {
+        throw V4ChunkedPrefillEnvError.invalidChunkTokens(rawChunkTokens)
+    }
+    return .production(chunkTokens: chunkTokens)
+}
+
 /// V4-family entry point. Raw `--prompt` completion only for now; the DSML
 /// chat path (`V4ChatFormat`) wires in with the server/front-end work.
 func runV4(args: Args,
@@ -59,6 +79,7 @@ func runV4(args: Args,
             expecting: .deepSeekV4Flash,
             streamingMode: .pread(slotCount: RuntimeConfiguration().expertCacheSlots),
             expertCachePolicy: .lfu)
+        let prefillConfig = try v4ChunkedPrefillConfigFromEnv()
         let producer = try V4LogitProducer(model: model, maxContext: args.maxContext)
         let scratch = try RawCompletionScratch(context: context,
                                                vocab: model.config.vocabSize)
@@ -74,7 +95,7 @@ func runV4(args: Args,
             scratch: scratch,
             // Decode-only runner: prompt tokens feed serially through
             // `produce` (V4F-06 prefill kernels replace this).
-            prefillConfig: .off) { progress in
+            prefillConfig: prefillConfig) { progress in
                 switch progress {
                 case .prefill:
                     break
@@ -89,7 +110,7 @@ func runV4(args: Args,
             let tokensPerSecond = stats.decodeSeconds > 0
                 ? Double(stats.newTokens) / stats.decodeSeconds
                 : 0
-            let footer = "\n[family=v4flash stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]\n"
+            let footer = "\n[family=v4flash stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok prefill_s=\(String(format: "%.3f", stats.prefillSeconds)) new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]\n"
             stderr.write(Data(footer.utf8))
         }
         return RunResult(exitCode: 0)

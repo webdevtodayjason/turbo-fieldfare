@@ -115,3 +115,14 @@ kernel void v4cg_hash_router_weights_sqrtsoftplus(
         outWeights[uint64_t(row) * 6ull + i] = scores[i] * inv;
     }
 }
+
+kernel void v4cg_add_f16(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* out [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) { return; }
+    out[gid] = a[gid] + b[gid];
+}
