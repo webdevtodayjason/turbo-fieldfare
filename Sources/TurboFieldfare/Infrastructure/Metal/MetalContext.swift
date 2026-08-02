@@ -96,6 +96,8 @@ public final class MetalContext: @unchecked Sendable {
         // norm, hash-layer routing weights).
         "attention_v4b",
         "attention_v4c",
+        // V4F-06b grouped routed-MoE prefill (FP4 + clamped SwiGLU).
+        "prefill_moe_v4",
         // Hook: sibling wave work adds more V4 modules. Register them by
         // appending the name here plus one row in `shaderSubdirectories`
         // below; no other call-site change is needed.
@@ -115,6 +117,7 @@ public final class MetalContext: @unchecked Sendable {
         "moe": "Metal/MoE",
         "moe_v4": "Metal/MoE",
         "prefill": "Metal/Prefill",
+        "prefill_moe_v4": "Metal/Prefill",
         "rmsnorm": "Metal/Primitives",
         "rope": "Metal/Primitives",
         "tensorops": "Metal/TensorCore",
