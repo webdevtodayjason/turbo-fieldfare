@@ -650,6 +650,10 @@ enum RepackPlanner {
                 }
                 consumedScales.insert(base + ".scale")
 
+                // 16-byte alignment keeps every entry eligible for the
+                // float4 loads in the fp32 GEMV (hc_scale is 12 bytes and
+                // would otherwise misalign followers).
+                fileCursor = align16(fileCursor)
                 let wOff = fileCursor
                 let wSize = weight.sizeBytes
                 let sOff = wOff + wSize
@@ -667,6 +671,7 @@ enum RepackPlanner {
                                                  scaleFmt: quant.scaleFmt),
                     sourceWeight: weight, sourceScales: scales, sourceBiases: nil))
             } else {
+                fileCursor = align16(fileCursor)
                 let off = fileCursor
                 let size = weight.sizeBytes
                 fileCursor = off + size
@@ -864,6 +869,10 @@ enum RepackPlanner {
 
     private static func align4(_ v: UInt64) -> UInt64 {
         (v + 3) & ~UInt64(3)
+    }
+
+    private static func align16(_ v: UInt64) -> UInt64 {
+        (v + 15) & ~UInt64(15)
     }
 
     private static func ietnyDtype(_ d: SourceTensor.Dtype) -> UInt8 {

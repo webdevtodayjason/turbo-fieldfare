@@ -31,7 +31,7 @@ import Metal
 ///   (CSA: prev/cur 4-row buffers, 1024-dim; HCA: 128 rows, 512-dim). A
 ///   row-offset variant of `V4QKVEpilogue.encodeDecode` would remove the
 ///   blit.
-final class V4ForwardRunner {
+public final class V4ForwardRunner {
 
     // MARK: - Dependencies
 
@@ -43,7 +43,6 @@ final class V4ForwardRunner {
     private let qkv: V4QKVEpilogue
     private let rope: V4RoPE
     private let hc: V4HyperConnections
-    private let outProj: V4OutputProjection
     private let hca: V4HCACompressor
     private let moe: MoEV4
     private let glue: V4DecodeGlue
@@ -85,16 +84,18 @@ final class V4ForwardRunner {
     private let csaCurKV: MTLBuffer      // [4, 1024] fp32
     private let csaPrevGate: MTLBuffer   // [4, 1024] fp32
     private let csaCurGate: MTLBuffer    // [4, 1024] fp32
-    private let idxPrevKV: MTLBuffer     // [4, 128] fp32 (indexer series)
-    private let idxCurKV: MTLBuffer      // [4, 128] fp32
-    private let idxPrevGate: MTLBuffer   // [4, 128] fp32
-    private let idxCurGate: MTLBuffer    // [4, 128] fp32
+    private let idxPrevKV: MTLBuffer     // [4, 256] fp32 (indexer series)
+    private let idxCurKV: MTLBuffer      // [4, 256] fp32
+    private let idxPrevGate: MTLBuffer   // [4, 256] fp32
+    private let idxCurGate: MTLBuffer    // [4, 256] fp32
+    private let lowRank: MTLBuffer       // [8192] fp16 o-proj stage 1
+    private let headF32: MTLBuffer       // [vocab, dim] fp32 (converted)
     private let hcaRingKV: MTLBuffer     // [128, 512] fp32
     private let hcaRingGate: MTLBuffer   // [128, 512] fp32
     private let rowScratch: MTLBuffer    // [1024] fp32 epilogue single row
     private let rowScratch2: MTLBuffer   // [1024] fp32 second series
 
-    init(model: V4Model, maxContext: Int) throws {
+    public init(model: V4Model, maxContext: Int) throws {
         self.model = model
         self.device = model.device
         let context = try V4ShaderLibrary.context(for: model.device)
@@ -111,7 +112,6 @@ final class V4ForwardRunner {
         self.qkv = try V4QKVEpilogue(device: model.device)
         self.rope = try V4RoPE(device: model.device)
         self.hc = try V4HyperConnections(device: model.device)
-        self.outProj = try V4OutputProjection(device: model.device)
         self.hca = try V4HCACompressor(device: model.device)
         self.moe = try MoEV4(context: context)
         self.glue = try V4DecodeGlue(context: context)
@@ -159,10 +159,23 @@ final class V4ForwardRunner {
         self.csaCurKV = try scratch(4 * 1024, "csaCurKV")
         self.csaPrevGate = try scratch(4 * 1024, "csaPrevGate")
         self.csaCurGate = try scratch(4 * 1024, "csaCurGate")
-        self.idxPrevKV = try scratch(4 * 128, "idxPrevKV")
-        self.idxCurKV = try scratch(4 * 128, "idxCurKV")
-        self.idxPrevGate = try scratch(4 * 128, "idxPrevGate")
-        self.idxCurGate = try scratch(4 * 128, "idxCurGate")
+        self.idxPrevKV = try scratch(4 * 256, "idxPrevKV")
+        self.idxCurKV = try scratch(4 * 256, "idxCurKV")
+        self.idxPrevGate = try scratch(4 * 256, "idxPrevGate")
+        self.idxCurGate = try scratch(4 * 256, "idxCurGate")
+        self.lowRank = try scratch16(8192, "lowRank")
+        // head.weight ships BF16; v4b_gemv_f32 wants fp32. Exact one-time
+        // widening (bf16 bits << 16) at init.
+        let headView = try model.lmHead
+        guard let headBuf = model.device.makeBuffer(
+                length: model.config.vocabSize * model.config.hiddenSize * 4,
+                options: .storageModeShared) else {
+            throw MetalError.missingFunction("v4 head staging")
+        }
+        widenBF16ToF32(src: headView.buffer.contents().advanced(by: Int(headView.offset)),
+                       dst: headBuf.contents(),
+                       count: model.config.vocabSize * model.config.hiddenSize)
+        self.headF32 = headBuf
         self.hcaRingKV = try scratch(128 * 512, "hcaRingKV")
         self.hcaRingGate = try scratch(128 * 512, "hcaRingGate")
         self.rowScratch = try scratch(1024, "rowScratch")
@@ -174,7 +187,7 @@ final class V4ForwardRunner {
     /// Embed `token` into the fp32 mHC stream, then run one decode token
     /// through the full stack. Returns the fp32 logits buffer (valid until
     /// the next call). `position` is the absolute 0-based token index.
-    func forward(token: UInt32, position: Int) async throws -> MTLBuffer {
+    public func forward(token: UInt32, position: Int) async throws -> MTLBuffer {
         let tokenCount = position + 1
 
         for layer in 0..<model.config.numLayers {
@@ -201,9 +214,10 @@ final class V4ForwardRunner {
                             hcScale: hcA.2.buffer, hcScaleOffset: Int(hcA.2.offset),
                             dim: dim, normEps: eps, hcEps: Float(model.config.hcEps))
             hc.encodePre(commandBuffer: cb1, x: stream, out: branch, dim: dim)
-            let attnNorm = try model.attnNorm(layer: layer)
+            let attnNorm = try gammaF32(model.attnNorm(layer: layer),
+                                        name: "layers.\(layer).attn_norm")
             glue.encodeRMSNormF32In(commandBuffer: cb1, x: branch,
-                                    w: attnNorm.buffer, wOffset: Int(attnNorm.offset),
+                                    w: attnNorm, wOffset: 0,
                                     out: xNorm, dim: UInt32(dim), eps: eps)
 
             let weights = try attentionWeights(layer: layer, kind: kind)
@@ -211,8 +225,8 @@ final class V4ForwardRunner {
             qkv.encodeDecode(commandBuffer: cb1, x: xNorm, position: position,
                              weights: weights, rope: ropeCfg, qOut: q,
                              windowSlot: .init(buffer: slot.buffer, offset: slot.offset),
-                             compressorWKVOut: kind == .passthrough ? nil : rowScratch,
-                             compressorWGateOut: kind == .passthrough ? nil : rowScratch2,
+                             compressorWKVOut: nil,
+                             compressorWGateOut: nil,
                              indexQOut: kind == .csa ? indexQ : nil,
                              normEps: eps)
             stageCompressorRows(commandBuffer: cb1, layer: layer, kind: kind,
@@ -229,13 +243,22 @@ final class V4ForwardRunner {
                         rows: model.config.numHeads, width: model.config.headDim,
                         ropeDim: model.config.qkRopeHeadDim,
                         position: -Float(position), inverse: true, config: ropeCfg)
+            // Grouped output projection as two FP8 GEMVs (wo_a is
+            // F8_E4M3 [8192, 4096] group-major; wo_b is [4096, 8192]).
             let woA = try model.woA(layer: layer)
             let woB = try model.woB(layer: layer)
-            outProj.encode(commandBuffer: cb1, o: attnOut,
-                           woA: woA.buffer, woAOffset: Int(woA.offset),
-                           woBWeights: woB.buffer, woBWeightsOffset: Int(woB.offset),
-                           woBScales: woB.buffer, woBScalesOffset: Int(woB.scaleOffset),
-                           out: oProjOut)
+            fp8.encode(commandBuffer: cb1,
+                       weights: woA.buffer, weightsOffset: Int(woA.offset),
+                       scales: woA.buffer, scalesOffset: Int(woA.scaleOffset),
+                       x: attnOut, y: lowRank,
+                       m: UInt32(model.config.oGroups * model.config.oLoraRank),
+                       n: UInt32(dim))
+            fp8.encode(commandBuffer: cb1,
+                       weights: woB.buffer, weightsOffset: Int(woB.offset),
+                       scales: woB.buffer, scalesOffset: Int(woB.scaleOffset),
+                       x: lowRank, y: oProjOut,
+                       m: UInt32(dim),
+                       n: UInt32(model.config.oGroups * model.config.oLoraRank))
             hc.encodePost(commandBuffer: cb1, residual: stream,
                           sublayer: oProjOut, out: stream, dim: dim)
 
@@ -248,9 +271,10 @@ final class V4ForwardRunner {
                             hcScale: hcF.2.buffer, hcScaleOffset: Int(hcF.2.offset),
                             dim: dim, normEps: eps, hcEps: Float(model.config.hcEps))
             hc.encodePre(commandBuffer: cb1, x: stream, out: branch, dim: dim)
-            let ffnNorm = try model.ffnNorm(layer: layer)
+            let ffnNorm = try gammaF32(model.ffnNorm(layer: layer),
+                                       name: "layers.\(layer).ffn_norm")
             glue.encodeRMSNormF32In(commandBuffer: cb1, x: branch,
-                                    w: ffnNorm.buffer, wOffset: Int(ffnNorm.offset),
+                                    w: ffnNorm, wOffset: 0,
                                     out: xNorm, dim: UInt32(dim), eps: eps)
             let isHash = model.config.isHashRouted(layer: layer)
             if !isHash {
@@ -276,10 +300,10 @@ final class V4ForwardRunner {
                 expertIDs = (0..<topK).map { Int(ptr[$0]) }
             }
             let plan = try model.planRoutedExperts(layer: layer, experts: expertIDs)
+            // Phase-1 subset indices are POSITIONS in the plan's top-K
+            // blob list (0..<topK), not cache slot numbers.
             let missSet = Set(plan.misses)
-            let hitSlots = plan.assignedSlots.indices
-                .filter { !missSet.contains($0) }
-                .map { plan.assignedSlots[$0] }
+            let hitPositions = (0..<topK).filter { !missSet.contains($0) }
             let blobs = try model.routedExpertBuffers(for: plan).map(\.buffer)
             let offsets = model.routedExpertV4Offsets(layer: layer)
             let argBuffer = moe.makeReusedRoutedArgumentBuffer(routedBlobs: blobs,
@@ -302,16 +326,16 @@ final class V4ForwardRunner {
                                                   k: UInt32(topK),
                                                   routeScale: routeScale)
             }
-            if !hitSlots.isEmpty {
-                uploadUInts(hitSlots.map { UInt32($0) }, to: slotUpload)
+            if !hitPositions.isEmpty {
+                uploadUInts(hitPositions.map { UInt32($0) }, to: slotUpload)
                 moe.encodeRoutedPhase1SwiGLUSubset(commandBuffer: cb2,
                                                    routedArgBuffer: argBuffer,
                                                    routedBlobs: blobs,
                                                    routedOffsets: offsets,
                                                    x: xNorm, acts: acts,
                                                    activeSlots: slotUpload,
-                                                   activeSlotIndices: hitSlots.map { UInt32($0) },
-                                                   activeCount: UInt32(hitSlots.count),
+                                                   activeSlotIndices: hitPositions.map { UInt32($0) },
+                                                   activeCount: UInt32(hitPositions.count),
                                                    d: UInt32(dim), f: UInt32(ffn),
                                                    topK: UInt32(topK))
             }
@@ -321,17 +345,17 @@ final class V4ForwardRunner {
             _ = try await model.fetchRoutedExperts(plan: plan)
 
             guard let cb3 = queue.makeCommandBuffer() else { throw MetalError.noQueue }
-            let missSlots = plan.misses.map { plan.assignedSlots[$0] }
-            if !missSlots.isEmpty {
-                uploadUInts(missSlots.map { UInt32($0) }, to: slotUpload)
+            let missPositions = plan.misses
+            if !missPositions.isEmpty {
+                uploadUInts(missPositions.map { UInt32($0) }, to: slotUpload)
                 moe.encodeRoutedPhase1SwiGLUSubset(commandBuffer: cb3,
                                                    routedArgBuffer: argBuffer,
                                                    routedBlobs: blobs,
                                                    routedOffsets: offsets,
                                                    x: xNorm, acts: acts,
                                                    activeSlots: slotUpload,
-                                                   activeSlotIndices: missSlots.map { UInt32($0) },
-                                                   activeCount: UInt32(missSlots.count),
+                                                   activeSlotIndices: missPositions.map { UInt32($0) },
+                                                   activeCount: UInt32(missPositions.count),
                                                    d: UInt32(dim), f: UInt32(ffn),
                                                    topK: UInt32(topK))
             }
@@ -364,13 +388,12 @@ final class V4ForwardRunner {
                             hcScale: hcH.2.buffer, hcScaleOffset: Int(hcH.2.offset),
                             dim: dim, normEps: eps, hcEps: Float(model.config.hcEps))
         hc.encodePre(commandBuffer: cbH, x: stream, out: branch, dim: dim)
-        let finalNorm = try model.finalNorm
+        let finalNorm = try gammaF32(model.finalNorm, name: "norm")
         glue.encodeRMSNormF32In(commandBuffer: cbH, x: branch,
-                                w: finalNorm.buffer, wOffset: Int(finalNorm.offset),
+                                w: finalNorm, wOffset: 0,
                                 out: xNorm, dim: UInt32(dim), eps: eps)
-        let head = try model.lmHead
         glue.encodeGemvF32(commandBuffer: cbH,
-                           weights: head.buffer, weightsOffset: Int(head.offset),
+                           weights: headF32, weightsOffset: 0,
                            x: xNorm, out: logits,
                            m: UInt32(model.config.vocabSize), n: UInt32(dim))
         cbH.commit()
@@ -387,30 +410,23 @@ final class V4ForwardRunner {
         let wkv = try model.wkv(layer: layer)
         let qNorm = try model.attnQNorm(layer: layer)
         let kvNorm = try model.attnKVNorm(layer: layer)
+        let qNormF32 = try gammaF32(qNorm, name: "layers.\(layer).attn.q_norm")
+        let kvNormF32 = try gammaF32(kvNorm, name: "layers.\(layer).attn.kv_norm")
         var w = V4QKVEpilogue.Weights(
             wqA: (wqA.buffer, wqA.buffer),
             wqB: (wqB.buffer, wqB.buffer),
-            qNormGamma: qNorm.buffer,
+            qNormGamma: qNormF32,
             windowWKV: (wkv.buffer, wkv.buffer),
-            kvNormGamma: kvNorm.buffer,
+            kvNormGamma: kvNormF32,
             compressorWKV: nil, compressorWGate: nil, indexerWqB: nil)
         w.wqACodesOffset = Int(wqA.offset)
         w.wqAScalesOffset = Int(wqA.scaleOffset)
         w.wqBCodesOffset = Int(wqB.offset)
         w.wqBScalesOffset = Int(wqB.scaleOffset)
-        w.qNormGammaOffset = Int(qNorm.offset)
+        w.qNormGammaOffset = 0
         w.windowWKVCodesOffset = Int(wkv.offset)
         w.windowWKVScalesOffset = Int(wkv.scaleOffset)
-        w.kvNormGammaOffset = Int(kvNorm.offset)
-        if kind != .passthrough {
-            let cwkv = try model.compressorWKV(layer: layer)
-            let cwg = try model.compressorWGate(layer: layer)
-            w.compressorWKV = cwkv.buffer
-            w.compressorWGate = cwg.buffer
-            w.compressorWKVOffset = Int(cwkv.offset)
-            w.compressorWGateOffset = Int(cwg.offset)
-            w.compressorOutDim = kind == .csa ? 1024 : 512
-        }
+        w.kvNormGammaOffset = 0
         if kind == .csa {
             let iqb = try model.indexerWQB(layer: layer)
             w.indexerWqB = (iqb.buffer, iqb.buffer)
@@ -428,26 +444,39 @@ final class V4ForwardRunner {
         guard kind != .passthrough else { return }
         let ratio = model.config.compressRatios[layer]
         let rowInGroup = position % ratio
+        // Compressor weights ship BF16; projections land fp32 (one row).
+        let outDim = UInt32(kind == .csa ? 1024 : 512)
+        if let cwkv = try? model.compressorWKV(layer: layer),
+           let cwg = try? model.compressorWGate(layer: layer) {
+            glue.encodeBF16GEMV(commandBuffer: cb,
+                                weights: cwkv.buffer, weightsOffset: Int(cwkv.offset),
+                                x: xNorm, out: rowScratch,
+                                m: outDim, d: UInt32(dim))
+            glue.encodeBF16GEMV(commandBuffer: cb,
+                                weights: cwg.buffer, weightsOffset: Int(cwg.offset),
+                                x: xNorm, out: rowScratch2,
+                                m: outDim, d: UInt32(dim))
+        }
         if kind == .csa {
             blitRow(commandBuffer: cb, from: rowScratch, to: csaCurKV,
                     rowBytes: 1024 * 4, row: rowInGroup)
             blitRow(commandBuffer: cb, from: rowScratch2, to: csaCurGate,
                     rowBytes: 1024 * 4, row: rowInGroup)
-            // Indexer series: separate 128-dim fp32 projections.
+            // Indexer series: 256-dim rows (two 128-dim overlapped series).
             if let ikv = try? model.indexerCompressorWKV(layer: layer),
                let ig = try? model.indexerCompressorWGate(layer: layer) {
-                glue.encodeGemvF32(commandBuffer: cb,
-                                   weights: ikv.buffer, weightsOffset: Int(ikv.offset),
-                                   x: xNorm, out: rowScratch,
-                                   m: 128, n: UInt32(dim))
-                glue.encodeGemvF32(commandBuffer: cb,
-                                   weights: ig.buffer, weightsOffset: Int(ig.offset),
-                                   x: xNorm, out: rowScratch2,
-                                   m: 128, n: UInt32(dim))
+                glue.encodeBF16GEMV(commandBuffer: cb,
+                                    weights: ikv.buffer, weightsOffset: Int(ikv.offset),
+                                    x: xNorm, out: rowScratch,
+                                    m: 256, d: UInt32(dim))
+                glue.encodeBF16GEMV(commandBuffer: cb,
+                                    weights: ig.buffer, weightsOffset: Int(ig.offset),
+                                    x: xNorm, out: rowScratch2,
+                                    m: 256, d: UInt32(dim))
                 blitRow(commandBuffer: cb, from: rowScratch, to: idxCurKV,
-                        rowBytes: 128 * 4, row: rowInGroup)
+                        rowBytes: 256 * 4, row: rowInGroup)
                 blitRow(commandBuffer: cb, from: rowScratch2, to: idxCurGate,
-                        rowBytes: 128 * 4, row: rowInGroup)
+                        rowBytes: 256 * 4, row: rowInGroup)
             }
         } else {
             blitRow(commandBuffer: cb, from: rowScratch, to: hcaRingKV,
@@ -606,6 +635,23 @@ final class V4ForwardRunner {
 
     // MARK: - Small utilities
 
+    /// Norm gammas ship BF16; the RMSNorm kernels want fp32 gammas.
+    /// Exact one-time widening per tensor, cached.
+    private var stagedGammas: [String: MTLBuffer] = [:]
+
+    private func gammaF32(_ view: TensorView, name: String) throws -> MTLBuffer {
+        if let staged = stagedGammas[name] { return staged }
+        let count = Int(view.length) / 2
+        guard let staged = device.makeBuffer(length: count * 4,
+                                             options: .storageModeShared) else {
+            throw MetalError.missingFunction("v4 gamma staging: \(name)")
+        }
+        widenBF16ToF32(src: view.buffer.contents().advanced(by: Int(view.offset)),
+                       dst: staged.contents(), count: count)
+        stagedGammas[name] = staged
+        return staged
+    }
+
     private func uploadInts(_ values: [Int32], to buffer: MTLBuffer) {
         let ptr = buffer.contents().assumingMemoryBound(to: Int32.self)
         for (i, v) in values.enumerated() { ptr[i] = v }
@@ -614,5 +660,16 @@ final class V4ForwardRunner {
     private func uploadUInts(_ values: [UInt32], to buffer: MTLBuffer) {
         let ptr = buffer.contents().assumingMemoryBound(to: UInt32.self)
         for (i, v) in values.enumerated() { ptr[i] = v }
+    }
+}
+
+/// Exact BF16 -> FP32 widening (bf16 is the top 16 bits of fp32).
+private func widenBF16ToF32(src: UnsafeMutableRawPointer,
+                            dst: UnsafeMutableRawPointer,
+                            count: Int) {
+    let s = src.assumingMemoryBound(to: UInt16.self)
+    let d = dst.assumingMemoryBound(to: UInt32.self)
+    for i in 0..<count {
+        d[i] = UInt32(s[i]) << 16
     }
 }
