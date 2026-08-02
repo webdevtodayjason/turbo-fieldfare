@@ -312,6 +312,15 @@ itself is deterministic model behavior (the prompt's flood sentence
 contains "when spring came", a distractor the greedy model takes at
 that exact length — with more context it answers "autumn"). Recorded
 as a model-quality note, not a pipeline bug.
+
+Ladder with the fixed runner through level 5 (88/153/259/374/589
+tokens): coherent text and correct retrieval at every depth, including
+HCA-active levels. Two deterministic wrong-season answers (259, 589)
+traced to the "when spring came" distractor in the story; both repeat
+byte-identically, so they are greedy model behavior, not corruption.
+The ladder's exact-answer criterion is a tripwire, not a quality
+metric; sampled-protocol output (0.2/64/0.95) verified coherent and
+non-looping separately.
 - **Drift RESOLVED (2026-08-02, diagnosis worker):** two runner
   composition bugs, both in `V4ForwardRunner.forward`, both
   per-token uniform (kernels and cache manager exonerated):
