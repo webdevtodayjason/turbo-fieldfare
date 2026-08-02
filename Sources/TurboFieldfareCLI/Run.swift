@@ -17,11 +17,20 @@ public func run(args: Args,
                 stderr: FileHandle = .standardError) async -> RunResult {
     do {
         let modelURL = URL(fileURLWithPath: args.model)
-        let tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
+        let v4Family = (try? ManifestReader.probeModelFamily(directoryURL: modelURL))
+            == ManifestReader.deepSeekV4FlashFamily
+        let tokenizer = v4Family
+            ? try await GFTokenizer.loadV4(forModelDirectory: modelURL)
+            : try await GFTokenizer.load(forModelDirectory: modelURL)
         let promptIds: [Int32]
         if let rawPrompt = args.prompt {
             promptIds = tokenizer.encode(rawPrompt, addBOS: true)
         } else if let messagesFile = args.messagesFile {
+            if v4Family {
+                return errored(stderr,
+                               "--messages-file is not yet supported for V4 models; use --prompt",
+                               2)
+            }
             let data = try Data(contentsOf: URL(fileURLWithPath: messagesFile),
                                 options: [.mappedIfSafe])
             let rows = try JSONDecoder().decode([MessageJSON].self, from: data)
@@ -53,6 +62,15 @@ public func run(args: Args,
             seed: args.seed,
             stopStrings: args.stops,
             extraStopTokens: [])
+        if v4Family {
+            return await runV4(args: args,
+                               modelURL: modelURL,
+                               tokenizer: tokenizer,
+                               promptIds: promptIds,
+                               config: config,
+                               stdout: stdout,
+                               stderr: stderr)
+        }
         let runtime = RuntimeConfiguration(
             forceLogitsHead: !config.isPureGreedy)
 
@@ -107,7 +125,7 @@ public func run(args: Args,
     }
 }
 
-private func errored(_ stderr: FileHandle, _ message: String, _ code: Int32) -> RunResult {
+func errored(_ stderr: FileHandle, _ message: String, _ code: Int32) -> RunResult {
     stderr.write(Data("error: \(message)\n".utf8))
     return RunResult(exitCode: code)
 }

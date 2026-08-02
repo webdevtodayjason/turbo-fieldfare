@@ -211,8 +211,8 @@ public struct V4ArchConfig: Sendable, Equatable {
         self.yarnBetaSlow = yarnBetaSlow
     }
 
-    /// Canonical DeepSeek V4-Flash baseline (43 layers, ratio 0 on 0/1/42,
-    /// CSA ratio 4 on even 2...40, HCA ratio 128 on odd 3...41).
+    /// Canonical DeepSeek V4-Flash baseline (43 layers, ratio 0 on 0/1, CSA ratio 4 on even
+    /// layers 2...42, HCA ratio 128 on odd layers 3...41).
     public static let deepSeekV4Flash = V4ArchConfig(
         numLayers: 43,
         hiddenSize: 4096,
@@ -256,7 +256,7 @@ public struct V4ArchConfig: Sendable, Equatable {
 
     private static func flashCompressRatios() -> [Int] {
         (0..<43).map { layer in
-            if layer == 0 || layer == 1 || layer == 42 { return 0 }
+            if layer < 2 { return 0 }
             return layer % 2 == 0 ? 4 : 128
         }
     }

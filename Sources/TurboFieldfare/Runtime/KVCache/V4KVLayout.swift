@@ -45,11 +45,11 @@ public struct V4CacheConfig: Sendable, Equatable {
     public var numLayers: Int { compressRatios.count }
     public var nonRopeDim: Int { headDim - ropeDim }
 
-    /// Published DeepSeek-V4-Flash layout: ratio 0 on layers 0, 1, 42;
+    /// Published DeepSeek-V4-Flash layout: ratio 0 on layers 0 and 1;
     /// ratio 4 (CSA) on even layers 2...40; ratio 128 (HCA) on odd 3...41.
     public static var deepSeekV4Flash: V4CacheConfig {
         let ratios = (0..<43).map { layer -> Int in
-            if layer == 0 || layer == 1 || layer == 42 { return 0 }
+            if layer < 2 { return 0 }
             return layer % 2 == 0 ? 4 : 128
         }
         return V4CacheConfig(compressRatios: ratios)
