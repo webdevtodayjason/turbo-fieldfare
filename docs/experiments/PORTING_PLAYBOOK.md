@@ -322,6 +322,22 @@ The ladder's exact-answer criterion is a tripwire, not a quality
 metric; sampled-protocol output (0.2/64/0.95) verified coherent and
 non-looping separately.
 
+V4F-06c component wave (2026-08-02, through `86c45ce`): the first
+"chunked" integration attempt was rejected because it only replayed
+`V4ForwardRunner.forward` once per prompt token behind an environment
+toggle. The replacement component stack is real batched/layer-major
+work: mHC/norm/RoPE boundaries (`463df17`), FP8/BF16 projections,
+window attention and grouped o-projection (`02d6fc5`, `97c4645`),
+embedding/router glue (`4581666`), per-layer attention/cache execution
+(`b92112a`, `1c1a921`), batched QKV/compressor projection (`9f22882`),
+and grouped routed-expert orchestration (`075f24c`). Three integration
+bugs were caught before composing the runner: wrapped 128-token window
+addressing, shared CSA/HCA accumulator state contaminating neighboring
+layers (`02bbb47`), and fp32 QKV/window projection results writing into
+fp16-sized scratch buffers (`86c45ce`). The corrected tree passes all
+147 V4-filtered tests. The remaining 06c-B gate is the actual runner,
+then token-exact serial parity and measured prefill speedup.
+
 Process note (2026-08-02): worker reliability. Four workers died
 mid-task across the port (penguin, sheep, sloth, badger), all in long
 reading phases, all from Kimi K3 API stream timeouts — infrastructure,
