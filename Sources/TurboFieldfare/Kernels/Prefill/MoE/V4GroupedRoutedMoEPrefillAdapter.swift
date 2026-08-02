@@ -192,6 +192,7 @@ final class V4GroupedRoutedMoEPrefillAdapter {
                                    pairMicrobatchRows: pairMicrobatchRows)
             commandBuffer.commit()
             await commandBuffer.completed()
+            if let error = commandBuffer.error { throw error }
             try lifetime.complete(tileIndex: tileIndex)
             pending = nextPending
         }
@@ -203,6 +204,7 @@ final class V4GroupedRoutedMoEPrefillAdapter {
                                    topK: UInt32(PrefillGroupedRoutedMoEV4.topK), d: UInt32(d))
         reduceCommandBuffer.commit()
         await reduceCommandBuffer.completed()
+        if let error = reduceCommandBuffer.error { throw error }
     }
 
     private func makeCommandBuffer() throws -> MTLCommandBuffer {

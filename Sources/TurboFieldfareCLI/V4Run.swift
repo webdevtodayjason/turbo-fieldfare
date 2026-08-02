@@ -4,13 +4,11 @@ import TurboFieldfare
 
 /// LogitProducer adapter for the DeepSeek V4 decode path (V4F-04/05).
 ///
-/// The shared raw-completion loop drives prefill by feeding prompt tokens
-/// one at a time, which suits the decode-only V4 runner (prefill kernels
-/// are the V4F-06 work item). The runner produces FP32 logits; the loop's
-/// sampler consumes FP16, so `produce` converts on CPU — about half a
-/// millisecond per token at this vocab, immaterial against expert I/O and
-/// recorded here as an optimization follow-up (a 2-line Metal kernel).
-final class V4LogitProducer: LogitProducer, @unchecked Sendable {
+/// The shared completion loop uses serial decode by default. Setting
+/// `TURBO_V4_CHUNKED_PREFILL=1` selects the layer-major batched prompt path.
+/// The runner produces FP32 logits; the loop's sampler consumes FP16, so
+/// `copyLogits` converts on CPU. This remains a small follow-up optimization.
+final class V4LogitProducer: ChunkedPrefillRunner, @unchecked Sendable {
     private let model: V4Model
     private let maxContext: Int
     private var runner: V4ForwardRunner
@@ -31,6 +29,26 @@ final class V4LogitProducer: LogitProducer, @unchecked Sendable {
     func produce(token: Int32, position: Int, into logits: MTLBuffer) async throws {
         let out = try await runner.forward(token: UInt32(bitPattern: token),
                                            position: position)
+        copyLogits(from: out, into: logits)
+    }
+
+    func prefillChunked(tokens: ArraySlice<Int32>,
+                        startPosition: Int,
+                        outputMode: PrefillOutputMode,
+                        config: PrefillRuntimeConfig,
+                        into logits: MTLBuffer,
+                        onProgress: (Int) -> Void) async throws -> PrefillResult {
+        _ = outputMode
+        let out = try await runner.prefillChunked(tokens: tokens,
+                                                  startPosition: startPosition,
+                                                  config: config)
+        copyLogits(from: out, into: logits)
+        onProgress(tokens.count)
+        return PrefillResult(newPosition: startPosition + tokens.count,
+                             seed: .logitsWritten)
+    }
+
+    private func copyLogits(from out: MTLBuffer, into logits: MTLBuffer) {
         let src = out.contents().assumingMemoryBound(to: Float.self)
         let dst = logits.contents().assumingMemoryBound(to: Float16.self)
         for i in 0..<vocab {
@@ -93,8 +111,6 @@ func runV4(args: Args,
             config: v4Config,
             context: context,
             scratch: scratch,
-            // Decode-only runner: prompt tokens feed serially through
-            // `produce` (V4F-06 prefill kernels replace this).
             prefillConfig: prefillConfig) { progress in
                 switch progress {
                 case .prefill:

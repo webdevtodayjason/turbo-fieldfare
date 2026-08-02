@@ -103,6 +103,7 @@ internal final class V4ChunkedPrefillState {
     internal init(model: V4Model,
                   cache: CompressedKVCacheManager,
                   attention: V4Attention,
+                  compressorAccumulators: V4CompressorAccumulatorStore,
                   maxRows: Int = 128) throws {
         precondition(maxRows > 0 && maxRows <= 128)
         self.model = model
@@ -126,7 +127,10 @@ internal final class V4ChunkedPrefillState {
         self.glue = try V4ChunkedPrefillGlue(device: model.device)
         self.routedMoE = try V4GroupedRoutedMoEPrefillAdapter(context: context)
         self.executors = try (0..<cfg.numLayers).map { _ in
-            try V4ChunkedPrefillExecutor(device: model.device, cache: cache, attention: attention)
+            try V4ChunkedPrefillExecutor(device: model.device,
+                                         cache: cache,
+                                         attention: attention,
+                                         accumulators: compressorAccumulators)
         }
 
         self.tokenIDs = try Self.makeUInt32Buffer(device: model.device, count: maxRows, label: "v4prefill.tokenIDs")

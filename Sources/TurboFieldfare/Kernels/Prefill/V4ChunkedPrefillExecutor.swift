@@ -11,8 +11,9 @@ import Metal
 /// through every layer, then the caller advances the shared cache cursor once by
 /// `rowCount` after all layers complete.
 ///
-/// Create one executor instance per layer. CSA/HCA staging accumulators are held
-/// by the executor and must not be shared across layers.
+/// Create one executor instance per layer. All executors may share one
+/// `V4CompressorAccumulatorStore`; the store keeps independent CSA/HCA state
+/// for every layer so prefill and decode can continue the same partial group.
 final class V4ChunkedPrefillExecutor {
     struct Inputs {
         let q: MTLBuffer; let qOffset: Int
@@ -71,26 +72,18 @@ final class V4ChunkedPrefillExecutor {
 
     private let cache: CompressedKVCacheManager, attention: V4Attention, hca: V4HCACompressor, glue: V4DecodeGlue
     private let config: V4CacheConfig
-    private let csaPrevKV, csaCurKV, csaPrevGate, csaCurGate: MTLBuffer
-    private let idxPrevKV, idxCurKV, idxPrevGate, idxCurGate: MTLBuffer
-    private let hcaKV, hcaGate: MTLBuffer
+    private let accumulators: V4CompressorAccumulatorStore
 
     init(device: MTLDevice, cache: CompressedKVCacheManager, attention: V4Attention,
-         hca: V4HCACompressor? = nil, glue: V4DecodeGlue? = nil) throws {
-        self.cache = cache; self.attention = attention; self.config = cache.config
+         hca: V4HCACompressor? = nil, glue: V4DecodeGlue? = nil,
+         accumulators: V4CompressorAccumulatorStore? = nil) throws {
+        let cacheConfig = cache.config
+        self.cache = cache; self.attention = attention; self.config = cacheConfig
         self.hca = try hca ?? V4HCACompressor(device: device)
         self.glue = try glue ?? V4DecodeGlue(context: V4ShaderLibrary.context(for: device))
-        func make(_ bytes: Int, _ label: String) throws -> MTLBuffer {
-            guard let b = device.makeBuffer(length: bytes, options: .storageModeShared) else { throw ModelError.residentBufferWrapFailed }
-            b.label = label
-            memset(b.contents(), 0, bytes)
-            return b
-        }
-        csaPrevKV = try make(4 * 1024 * 4, "v4prefill.csa.prevKV"); csaCurKV = try make(4 * 1024 * 4, "v4prefill.csa.curKV")
-        csaPrevGate = try make(4 * 1024 * 4, "v4prefill.csa.prevGate"); csaCurGate = try make(4 * 1024 * 4, "v4prefill.csa.curGate")
-        idxPrevKV = try make(4 * 256 * 4, "v4prefill.idx.prevKV"); idxCurKV = try make(4 * 256 * 4, "v4prefill.idx.curKV")
-        idxPrevGate = try make(4 * 256 * 4, "v4prefill.idx.prevGate"); idxCurGate = try make(4 * 256 * 4, "v4prefill.idx.curGate")
-        hcaKV = try make(128 * 512 * 4, "v4prefill.hca.kv"); hcaGate = try make(128 * 512 * 4, "v4prefill.hca.gate")
+        self.accumulators = try accumulators ?? V4CompressorAccumulatorStore(
+            device: device,
+            layerKinds: cacheConfig.compressRatios.indices.map { cacheConfig.kind(layer: $0) })
     }
 
     func encode(commandBuffer cb: MTLCommandBuffer, layer: Int, startPosition: Int, rowCount: Int,
@@ -118,11 +111,13 @@ final class V4ChunkedPrefillExecutor {
         let r = pos % config.compressRatio(layer: layer)
         let kv = i.compressorKVOffset + row * i.rowStrideCompressor, gate = i.compressorGateOffset + row * i.rowStrideCompressor
         if kind == .csa {
-            copy(cb, i.compressorKV!, kv, csaCurKV, r * 1024 * 4, 1024 * 4); copy(cb, i.compressorGate!, gate, csaCurGate, r * 1024 * 4, 1024 * 4)
-            copy(cb, i.indexerCompressorKV!, i.indexerCompressorKVOffset + row * 256 * 4, idxCurKV, r * 256 * 4, 256 * 4)
-            copy(cb, i.indexerCompressorGate!, i.indexerCompressorGateOffset + row * 256 * 4, idxCurGate, r * 256 * 4, 256 * 4)
+            let state = accumulators.csa(layer: layer)
+            copy(cb, i.compressorKV!, kv, state.curKV, r * 1024 * 4, 1024 * 4); copy(cb, i.compressorGate!, gate, state.curGate, r * 1024 * 4, 1024 * 4)
+            copy(cb, i.indexerCompressorKV!, i.indexerCompressorKVOffset + row * 256 * 4, state.idxCurKV, r * 256 * 4, 256 * 4)
+            copy(cb, i.indexerCompressorGate!, i.indexerCompressorGateOffset + row * 256 * 4, state.idxCurGate, r * 256 * 4, 256 * 4)
         } else {
-            copy(cb, i.compressorKV!, kv, hcaKV, r * 512 * 4, 512 * 4); copy(cb, i.compressorGate!, gate, hcaGate, r * 512 * 4, 512 * 4)
+            let state = accumulators.hca(layer: layer)
+            copy(cb, i.compressorKV!, kv, state.ringKV, r * 512 * 4, 512 * 4); copy(cb, i.compressorGate!, gate, state.ringGate, r * 512 * 4, 512 * 4)
         }
     }
 
@@ -130,20 +125,21 @@ final class V4ChunkedPrefillExecutor {
         let group = cache.groupIndex(layer: layer, tokenPosition: pos), slot = cache.compressedSlot(layer: layer, group: group)
         let ropePos = UInt32(cache.ropePosition(layer: layer, group: group))
         if kind == .csa {
-            attention.encodeCSACompressGroup(commandBuffer: cb, prevKV: csaPrevKV, curKV: csaCurKV, prevGate: csaPrevGate, curGate: csaCurGate,
+            let state = accumulators.csa(layer: layer)
+            attention.encodeCSACompressGroup(commandBuffer: cb, prevKV: state.prevKV, curKV: state.curKV, prevGate: state.prevGate, curGate: state.curGate,
                                              ape: w.ape, apeOffset: w.apeOffset, gamma: w.gamma, gammaOffset: w.gammaOffset,
                                              outValues: slot.values.buffer, valuesOffset: slot.values.offset, outScales: slot.scales.buffer, scalesOffset: slot.scales.offset,
                                              outRope: slot.rope.buffer, ropeOffset: slot.rope.offset, ropePosition: ropePos, ropeTheta: rope.theta,
                                              yarnFactor: rope.yarnFactor, originalSeqLen: rope.originalSeqLen, betaFast: rope.betaFast, betaSlow: rope.betaSlow,
                                              useYarn: rope.useYarn, normEps: eps)
             let idx = cache.indexerSlot(layer: layer, group: group)
-            glue.encodeIndexerCompressGroup(commandBuffer: cb, prevKV: idxPrevKV, curKV: idxCurKV, prevGate: idxPrevGate, curGate: idxCurGate,
+            glue.encodeIndexerCompressGroup(commandBuffer: cb, prevKV: state.idxPrevKV, curKV: state.idxCurKV, prevGate: state.idxPrevGate, curGate: state.idxCurGate,
                                             ape: w.indexerAPE!, apeOffset: w.indexerAPEOffset, gamma: w.indexerGamma!, gammaOffset: w.indexerGammaOffset,
                                             out: idx.buffer, outOffset: idx.offset, ropePosition: ropePos, rope: rope, normEps: eps)
-            copy(cb, csaCurKV, 0, csaPrevKV, 0, 4 * 1024 * 4); copy(cb, csaCurGate, 0, csaPrevGate, 0, 4 * 1024 * 4)
-            copy(cb, idxCurKV, 0, idxPrevKV, 0, 4 * 256 * 4); copy(cb, idxCurGate, 0, idxPrevGate, 0, 4 * 256 * 4)
+            accumulators.rollCSA(commandBuffer: cb, layer: layer)
         } else if kind == .hca {
-            hca.encodeGroup(commandBuffer: cb, kv: hcaKV, gate: hcaGate, ape: w.ape, apeOffset: w.apeOffset, gamma: w.gamma, gammaOffset: w.gammaOffset,
+            let state = accumulators.hca(layer: layer)
+            hca.encodeGroup(commandBuffer: cb, kv: state.ringKV, gate: state.ringGate, ape: w.ape, apeOffset: w.apeOffset, gamma: w.gamma, gammaOffset: w.gammaOffset,
                             outValues: slot.values.buffer, valuesOffset: slot.values.offset, outScales: slot.scales.buffer, scalesOffset: slot.scales.offset,
                             outRope: slot.rope.buffer, ropeOffset: slot.rope.offset, ropePosition: ropePos, rope: rope, normEps: eps)
         }

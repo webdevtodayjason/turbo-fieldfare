@@ -57,6 +57,7 @@ public final class V4ForwardRunner {
     private let model: V4Model
     private let device: MTLDevice
     private let queue: MTLCommandQueue
+    private let maxContext: Int
     private let cache: CompressedKVCacheManager
     private let attention: V4Attention
     private let qkv: V4QKVEpilogue
@@ -117,10 +118,13 @@ public final class V4ForwardRunner {
     private let headF32: MTLBuffer       // [vocab, dim] fp32 (converted)
     private let rowScratch: MTLBuffer    // [1024] fp32 epilogue single row
     private let rowScratch2: MTLBuffer   // [1024] fp32 second series
+    private var chunkedPrefillState: V4ChunkedPrefillState?
+    private var chunkedPrefillDirty = false
 
     public init(model: V4Model, maxContext: Int) throws {
         self.model = model
         self.device = model.device
+        self.maxContext = maxContext
         let context = try V4ShaderLibrary.context(for: model.device)
         self.queue = context.queue
         let cacheConfig = V4CacheConfig(compressRatios: model.config.compressRatios,
@@ -211,6 +215,14 @@ public final class V4ForwardRunner {
     /// through the full stack. Returns the fp32 logits buffer (valid until
     /// the next call). `position` is the absolute 0-based token index.
     public func forward(token: UInt32, position: Int) async throws -> MTLBuffer {
+        guard !chunkedPrefillDirty else {
+            throw PrefillError.chunkedRunnerDirty(
+                "V4 decode rejected because a failed chunked prefill left cache state dirty; reset the producer")
+        }
+        guard position == cache.position else {
+            throw PrefillError.prefillCursorMismatch(
+                "V4 decode position \(position) != cache cursor \(cache.position)")
+        }
         let tokenCount = position + 1
 
         for layer in 0..<model.config.numLayers {
@@ -487,6 +499,455 @@ public final class V4ForwardRunner {
         cbH.commit()
         await cbH.completed()
         return logits
+    }
+
+    // MARK: - Chunked prefill
+
+    /// Run prompt tokens through the model in token-major chunks and
+    /// layer-major order. This path never replays `forward`; projections and
+    /// boundaries are batched while the existing sparse-attention decode
+    /// kernels are queued causally for each row.
+    public func prefillChunked(tokens: ArraySlice<Int32>,
+                               startPosition: Int,
+                               config: PrefillRuntimeConfig) async throws -> MTLBuffer {
+        guard config.mode == .chunked else {
+            throw PrefillError.chunkedUnsupported(
+                "V4 prefillChunked requires PrefillRuntimeConfig.mode == .chunked")
+        }
+        guard !chunkedPrefillDirty else {
+            throw PrefillError.chunkedRunnerDirty(
+                "V4 chunked prefill rejected because a previous chunk failed; reset the producer")
+        }
+        guard startPosition == cache.position else {
+            throw PrefillError.prefillCursorMismatch(
+                "V4 chunked prefill cursor \(cache.position) != startPosition \(startPosition)")
+        }
+        guard startPosition >= 0, tokens.count <= maxContext - startPosition else {
+            throw PrefillError.chunkedUnsupported(
+                "V4 chunked prefill range [\(startPosition), \(startPosition + tokens.count)) exceeds maxContext \(maxContext)")
+        }
+        guard !tokens.isEmpty else { return logits }
+
+        let state: V4ChunkedPrefillState
+        if let existing = chunkedPrefillState, existing.maxRows >= config.chunkTokens {
+            state = existing
+        } else {
+            let created = try V4ChunkedPrefillState(model: model,
+                                                    cache: cache,
+                                                    attention: attention,
+                                                    compressorAccumulators: compressorAccumulators,
+                                                    maxRows: config.chunkTokens)
+            chunkedPrefillState = created
+            state = created
+        }
+
+        let spans = PrefillChunkPlanner.spans(tokenCount: tokens.count,
+                                              startPosition: startPosition,
+                                              config: config)
+        for span in spans {
+            let lower = tokens.index(tokens.startIndex, offsetBy: span.tokenOffset)
+            let upper = tokens.index(lower, offsetBy: span.tokenCount)
+            try await executePrefillChunk(tokens: tokens[lower..<upper],
+                                          startPosition: span.startPosition,
+                                          state: state)
+        }
+        return logits
+    }
+
+    private func executePrefillChunk(tokens: ArraySlice<Int32>,
+                                     startPosition: Int,
+                                     state: V4ChunkedPrefillState) async throws {
+        let rows = tokens.count
+        precondition(rows > 0 && rows <= state.maxRows)
+        guard cache.position == startPosition else {
+            throw PrefillError.prefillCursorMismatch(
+                "V4 chunk cursor \(cache.position) != span start \(startPosition)")
+        }
+
+        state.uploadTokenIDs(tokens.map { UInt32(bitPattern: $0) })
+        state.fillPositions(startPosition: startPosition, rowCount: rows)
+        chunkedPrefillDirty = true
+        do {
+            guard let embedCB = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+            let embedding = try model.embedding
+            state.glue.encodeBF16EmbeddingGatherBroadcast(
+                commandBuffer: embedCB,
+                embeddings: embedding.buffer,
+                embeddingsOffset: Int(embedding.offset),
+                tokenIDs: state.tokenIDs,
+                out: state.stream,
+                rows: rows,
+                dim: dim)
+            embedCB.commit()
+            await embedCB.completed()
+            if let error = embedCB.error { throw error }
+
+            for layer in 0..<model.config.numLayers {
+                try await executePrefillLayer(layer: layer,
+                                              tokens: tokens,
+                                              startPosition: startPosition,
+                                              rows: rows,
+                                              state: state)
+            }
+
+            // Every layer consumed the same absolute chunk range. Only now
+            // may the shared cache cursor move to the next prompt span.
+            for _ in 0..<rows { cache.advance() }
+            try await encodePrefillHead(state: state, lastRow: rows - 1)
+            chunkedPrefillDirty = false
+        } catch {
+            // The runner may have written window/compressed rows without a
+            // matching cursor commit. A fresh runner is required after this.
+            throw error
+        }
+    }
+
+    private func executePrefillLayer(layer: Int,
+                                     tokens: ArraySlice<Int32>,
+                                     startPosition: Int,
+                                     rows: Int,
+                                     state: V4ChunkedPrefillState) async throws {
+        let kind = cache.layerKind(layer)
+        let ropeConfig = V4RoPE.Config.forLayer(kind)
+        guard let cb = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+
+        // Attention boundary and input norm.
+        let hcAttnFn = try model.hcAttnFn(layer: layer)
+        let hcAttnBase = try model.hcAttnBase(layer: layer)
+        let hcAttnScale = try model.hcAttnScale(layer: layer)
+        state.boundary.encodeParams(commandBuffer: cb,
+                                    x: state.stream,
+                                    hcFn: hcAttnFn.buffer, hcFnOffset: Int(hcAttnFn.offset),
+                                    hcBase: hcAttnBase.buffer, hcBaseOffset: Int(hcAttnBase.offset),
+                                    hcScale: hcAttnScale.buffer, hcScaleOffset: Int(hcAttnScale.offset),
+                                    rows: rows, dim: dim,
+                                    normEps: eps, hcEps: Float(model.config.hcEps))
+        state.boundary.encodePre(commandBuffer: cb,
+                                 x: state.stream,
+                                 out: state.branch,
+                                 rows: rows, dim: dim)
+        let attnNorm = try gammaF32(model.attnNorm(layer: layer),
+                                    name: "layers.\(layer).attn_norm")
+        state.boundary.encodeRMSNorm(commandBuffer: cb,
+                                     x: state.branch,
+                                     gamma: attnNorm,
+                                     out: state.xNorm,
+                                     rows: rows, n: dim, eps: eps)
+
+        var weights = try attentionWeights(layer: layer, kind: kind)
+        if kind != .passthrough {
+            let compressorWKV = try model.compressorWKV(layer: layer)
+            let compressorWGate = try model.compressorWGate(layer: layer)
+            weights.compressorWKV = compressorWKV.buffer
+            weights.compressorWGate = compressorWGate.buffer
+            weights.compressorWKVOffset = Int(compressorWKV.offset)
+            weights.compressorWGateOffset = Int(compressorWGate.offset)
+            weights.compressorOutDim = kind == .csa ? 1024 : 512
+        }
+
+        var qkvOutputs = V4BatchedQKVCompressorPrefillStage.Outputs(
+            qOut: state.q,
+            windowKVOut: state.windowKV)
+        if kind != .passthrough {
+            qkvOutputs.compressorWKVOut = state.compressorKV
+            qkvOutputs.compressorWGateOut = state.compressorGate
+        }
+        if kind == .csa {
+            qkvOutputs.indexQOut = state.indexQ
+            let indexWeightsProjection = try model.indexerWeightsProj(layer: layer)
+            state.proj.encodeBF16GEMM(commandBuffer: cb,
+                                      weights: indexWeightsProjection.buffer,
+                                      weightsOffset: Int(indexWeightsProjection.offset),
+                                      x: state.xNorm,
+                                      out: state.indexWeights,
+                                      rows: rows,
+                                      m: model.config.indexNHeads,
+                                      n: dim,
+                                      outFP16: false)
+            let indexerWKV = try model.indexerCompressorWKV(layer: layer)
+            let indexerWGate = try model.indexerCompressorWGate(layer: layer)
+            state.proj.encodeBF16GEMM(commandBuffer: cb,
+                                      weights: indexerWKV.buffer,
+                                      weightsOffset: Int(indexerWKV.offset),
+                                      x: state.xNorm,
+                                      out: state.indexerCompressorKV,
+                                      rows: rows, m: 256, n: dim,
+                                      outFP16: false)
+            state.proj.encodeBF16GEMM(commandBuffer: cb,
+                                      weights: indexerWGate.buffer,
+                                      weightsOffset: Int(indexerWGate.offset),
+                                      x: state.xNorm,
+                                      out: state.indexerCompressorGate,
+                                      rows: rows, m: 256, n: dim,
+                                      outFP16: false)
+        }
+        state.qkvStage.encode(commandBuffer: cb,
+                              hiddenRows: state.xNorm,
+                              rowCount: rows,
+                              startPosition: startPosition,
+                              weights: weights,
+                              rope: ropeConfig,
+                              outputs: qkvOutputs,
+                              normEps: eps)
+
+        let sinks = try model.attnSink(layer: layer)
+        var compressorWeights: V4ChunkedPrefillExecutor.CompressorWeights?
+        if kind != .passthrough {
+            let ape = try model.compressorAPE(layer: layer)
+            let gamma = try model.compressorNorm(layer: layer)
+            if kind == .csa {
+                let indexerAPE = try model.indexerCompressorAPE(layer: layer)
+                let indexerGamma = try model.indexerCompressorNorm(layer: layer)
+                compressorWeights = .init(ape: ape.buffer, apeOffset: Int(ape.offset),
+                                          gamma: gamma.buffer, gammaOffset: Int(gamma.offset),
+                                          indexerAPE: indexerAPE.buffer,
+                                          indexerAPEOffset: Int(indexerAPE.offset),
+                                          indexerGamma: indexerGamma.buffer,
+                                          indexerGammaOffset: Int(indexerGamma.offset))
+            } else {
+                compressorWeights = .init(ape: ape.buffer, apeOffset: Int(ape.offset),
+                                          gamma: gamma.buffer, gammaOffset: Int(gamma.offset))
+            }
+        }
+        let executorInputs = V4ChunkedPrefillExecutor.Inputs(
+            q: state.q,
+            windowKV: state.windowKV,
+            indexQ: kind == .csa ? state.indexQ : nil,
+            indexWeights: kind == .csa ? state.indexWeights : nil,
+            compressorKV: kind == .passthrough ? nil : state.compressorKV,
+            compressorGate: kind == .passthrough ? nil : state.compressorGate,
+            indexerCompressorKV: kind == .csa ? state.indexerCompressorKV : nil,
+            indexerCompressorGate: kind == .csa ? state.indexerCompressorGate : nil,
+            sinks: sinks.buffer,
+            sinksOffset: Int(sinks.offset),
+            output: state.attn,
+            rowStrideCompressor: (kind == .csa ? 1024 : 512) * MemoryLayout<Float>.stride)
+        state.executors[layer].encode(commandBuffer: cb,
+                                      layer: layer,
+                                      startPosition: startPosition,
+                                      rowCount: rows,
+                                      inputs: executorInputs,
+                                      compressorWeights: compressorWeights,
+                                      rope: ropeConfig,
+                                      normEps: eps)
+
+        // De-rotate each query-head output at its positive absolute position,
+        // then apply the checkpoint's grouped low-rank output projection.
+        state.boundary.encodeRoPE(commandBuffer: cb,
+                                  x: state.attn,
+                                  positions: state.repeatedHeadPositions,
+                                  rows: rows * model.config.numHeads,
+                                  width: model.config.headDim,
+                                  ropeDim: model.config.qkRopeHeadDim,
+                                  inverse: true,
+                                  config: ropeConfig)
+        let woA = try model.woA(layer: layer)
+        let woB = try model.woB(layer: layer)
+        state.proj.encodeGroupedOProjDown(commandBuffer: cb,
+                                          attn: state.attn,
+                                          woAWeights: woA.buffer,
+                                          woAWeightsOffset: Int(woA.offset),
+                                          woAScales: woA.buffer,
+                                          woAScalesOffset: Int(woA.scaleOffset),
+                                          rows: rows,
+                                          lowRank: state.lowRank)
+        state.proj.encodeOProjUp(commandBuffer: cb,
+                                 lowRank: state.lowRank,
+                                 woBWeights: woB.buffer,
+                                 woBWeightsOffset: Int(woB.offset),
+                                 woBScales: woB.buffer,
+                                 woBScalesOffset: Int(woB.scaleOffset),
+                                 rows: rows,
+                                 out: state.oProj)
+        state.boundary.encodePost(commandBuffer: cb,
+                                  residual: state.stream,
+                                  sublayer: state.oProj,
+                                  out: state.stream,
+                                  rows: rows, dim: dim)
+
+        // FFN boundary and batched router/shared-expert work.
+        let hcFfnFn = try model.hcFfnFn(layer: layer)
+        let hcFfnBase = try model.hcFfnBase(layer: layer)
+        let hcFfnScale = try model.hcFfnScale(layer: layer)
+        state.boundary.encodeParams(commandBuffer: cb,
+                                    x: state.stream,
+                                    hcFn: hcFfnFn.buffer, hcFnOffset: Int(hcFfnFn.offset),
+                                    hcBase: hcFfnBase.buffer, hcBaseOffset: Int(hcFfnBase.offset),
+                                    hcScale: hcFfnScale.buffer, hcScaleOffset: Int(hcFfnScale.offset),
+                                    rows: rows, dim: dim,
+                                    normEps: eps, hcEps: Float(model.config.hcEps))
+        state.boundary.encodePre(commandBuffer: cb,
+                                 x: state.stream,
+                                 out: state.branch,
+                                 rows: rows, dim: dim)
+        let ffnNorm = try gammaF32(model.ffnNorm(layer: layer),
+                                   name: "layers.\(layer).ffn_norm")
+        state.boundary.encodeRMSNorm(commandBuffer: cb,
+                                     x: state.branch,
+                                     gamma: ffnNorm,
+                                     out: state.xNorm,
+                                     rows: rows, n: dim, eps: eps)
+
+        let router = try model.routerWeight(layer: layer)
+        state.proj.encodeBF16GEMM(commandBuffer: cb,
+                                  weights: router.buffer,
+                                  weightsOffset: Int(router.offset),
+                                  x: state.xNorm,
+                                  out: state.routerLogits,
+                                  rows: rows, m: numExperts, n: dim,
+                                  outFP16: false)
+        let hashRouted = model.config.isHashRouted(layer: layer)
+        let tokenIDs = tokens.map { UInt32(bitPattern: $0) }
+        var hashExpertIDs: [UInt32] = []
+        if hashRouted {
+            hashExpertIDs.reserveCapacity(rows * topK)
+            for token in tokenIDs {
+                hashExpertIDs.append(contentsOf:
+                    try model.hashExpertIDs(layer: layer, token: token).map(UInt32.init))
+            }
+            state.uploadTokenIDs(tokenIDs)
+            let routePointer = state.routeIDs.contents().assumingMemoryBound(to: UInt32.self)
+            for (index, expert) in hashExpertIDs.enumerated() { routePointer[index] = expert }
+            state.glue.encodeHashRouterWeights(commandBuffer: cb,
+                                                logits: state.routerLogits,
+                                                tid2eid: state.routeIDs,
+                                                outWeights: state.routeWeights,
+                                                rows: rows,
+                                                routeScale: routeScale)
+        } else {
+            let bias = try model.routerBias(layer: layer)
+            state.glue.encodeRouterTop6(commandBuffer: cb,
+                                        logits: state.routerLogits,
+                                        staticBias: bias.buffer,
+                                        staticBiasOffset: Int(bias.offset),
+                                        outIDs: state.routeIDs,
+                                        outWeights: state.routeWeights,
+                                        rows: rows,
+                                        routeScale: routeScale)
+        }
+
+        try encodePrefillSharedExpert(commandBuffer: cb,
+                                      layer: layer,
+                                      rows: rows,
+                                      state: state)
+        cb.commit()
+        await cb.completed()
+        if let error = cb.error { throw error }
+
+        let expertIDs: [UInt32]
+        if hashRouted {
+            expertIDs = hashExpertIDs
+        } else {
+            let pointer = state.routeIDs.contents().assumingMemoryBound(to: UInt32.self)
+            expertIDs = (0..<(rows * topK)).map { pointer[$0] }
+        }
+        var pairs: [PrefillTokenExpertPair] = []
+        pairs.reserveCapacity(rows * topK)
+        for row in 0..<rows {
+            for rank in 0..<topK {
+                pairs.append(PrefillTokenExpertPair(
+                    token: UInt32(row),
+                    expert: expertIDs[row * topK + rank],
+                    rank: UInt32(rank),
+                    weight: 0))
+            }
+        }
+        let routed = try await state.routedMoE.encode(
+            provider: model,
+            hidden: state.xNorm,
+            pairs: pairs,
+            routeWeights: state.routeWeights,
+            layer: layer,
+            queryCount: rows,
+            numExperts: numExperts,
+            d: dim,
+            routedIntermediate: ffn,
+            hiddenStrideElements: dim)
+
+        guard let postCB = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+        state.glue.encodeAddF16(commandBuffer: postCB,
+                                a: routed.output,
+                                b: state.sharedOut,
+                                out: state.routedPlusShared,
+                                count: rows * dim)
+        state.boundary.encodePost(commandBuffer: postCB,
+                                  residual: state.stream,
+                                  sublayer: state.routedPlusShared,
+                                  out: state.stream,
+                                  rows: rows, dim: dim)
+        postCB.commit()
+        await postCB.completed()
+        if let error = postCB.error { throw error }
+    }
+
+    private func encodePrefillSharedExpert(commandBuffer cb: MTLCommandBuffer,
+                                           layer: Int,
+                                           rows: Int,
+                                           state: V4ChunkedPrefillState) throws {
+        let w1 = try model.sharedExpertW1(layer: layer)
+        let w3 = try model.sharedExpertW3(layer: layer)
+        let w2 = try model.sharedExpertW2(layer: layer)
+        state.proj.encodeFP8GEMM(commandBuffer: cb,
+                                 weights: w1.buffer, weightsOffset: Int(w1.offset),
+                                 scales: w1.buffer, scalesOffset: Int(w1.scaleOffset),
+                                 x: state.xNorm,
+                                 out: state.sharedGate,
+                                 rows: rows, m: ffn, n: dim,
+                                 outFP16: true)
+        state.proj.encodeFP8GEMM(commandBuffer: cb,
+                                 weights: w3.buffer, weightsOffset: Int(w3.offset),
+                                 scales: w3.buffer, scalesOffset: Int(w3.scaleOffset),
+                                 x: state.xNorm,
+                                 out: state.sharedUp,
+                                 rows: rows, m: ffn, n: dim,
+                                 outFP16: true)
+        glue.encodeSwiGLUAct(commandBuffer: cb,
+                             gate: state.sharedGate,
+                             up: state.sharedUp,
+                             act: state.sharedAct,
+                             n: UInt32(rows * ffn),
+                             limit: swigluLimit)
+        state.proj.encodeFP8GEMM(commandBuffer: cb,
+                                 weights: w2.buffer, weightsOffset: Int(w2.offset),
+                                 scales: w2.buffer, scalesOffset: Int(w2.scaleOffset),
+                                 x: state.sharedAct,
+                                 out: state.sharedOut,
+                                 rows: rows, m: dim, n: ffn,
+                                 outFP16: true)
+    }
+
+    private func encodePrefillHead(state: V4ChunkedPrefillState,
+                                   lastRow: Int) async throws {
+        guard let cb = queue.makeCommandBuffer() else { throw MetalError.noQueue }
+        let streamOffset = lastRow * streams * dim * MemoryLayout<Float>.stride
+        let hcHeadFn = try model.hcHeadFn
+        let hcHeadBase = try model.hcHeadBase
+        let hcHeadScale = try model.hcHeadScale
+        hc.encodeHeadParams(commandBuffer: cb,
+                            x: state.stream, xOffset: streamOffset,
+                            hcFn: hcHeadFn.buffer, hcFnOffset: Int(hcHeadFn.offset),
+                            hcBase: hcHeadBase.buffer, hcBaseOffset: Int(hcHeadBase.offset),
+                            hcScale: hcHeadScale.buffer, hcScaleOffset: Int(hcHeadScale.offset),
+                            dim: dim, normEps: eps,
+                            hcEps: Float(model.config.hcEps))
+        hc.encodePre(commandBuffer: cb,
+                     x: state.stream, xOffset: streamOffset,
+                     out: branch, dim: dim)
+        let finalNorm = try gammaF32(model.finalNorm, name: "norm")
+        glue.encodeRMSNormF32In(commandBuffer: cb,
+                                x: branch,
+                                w: finalNorm,
+                                out: xNorm,
+                                dim: UInt32(dim), eps: eps)
+        glue.encodeGemvF32(commandBuffer: cb,
+                           weights: headF32,
+                           x: xNorm,
+                           out: logits,
+                           m: UInt32(model.config.vocabSize),
+                           n: UInt32(dim))
+        cb.commit()
+        await cb.completed()
+        if let error = cb.error { throw error }
     }
 
     // MARK: - Per-layer assembly
