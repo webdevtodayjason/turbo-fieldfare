@@ -284,6 +284,15 @@ non-repetitive and correct; 57-token story QA answers "Autumn" and
 quotes the exact evidence sentence; 231-token story QA answers
 correctly with the CSA compressed path active. 122/122 tests green
 (test CPU references updated to the interleaved convention).
+
+Long-context gate (2026-08-02): 296-token prompt with both CSA and HCA
+compressed entries attended (HCA activates past 256 tokens) answers
+correctly and terminates on EOS: "The festival is held in the autumn."
+Remaining known minor divergences for later: CSA group-0 overlap
+zero-init vs the reference's -inf score state, and the indexer
+Hadamard + FP4 QAT sim (write-side), both invisible in these gates.
+True long-context (2K+) validation and NLL-style checks remain open
+until prefill kernels land (serial prompt feeding is ~0.7 s/token).
 - **Drift RESOLVED (2026-08-02, diagnosis worker):** two runner
   composition bugs, both in `V4ForwardRunner.forward`, both
   per-token uniform (kernels and cache manager exonerated):
