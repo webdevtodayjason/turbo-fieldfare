@@ -51,6 +51,7 @@ final class V4BatchedQKVCompressorPrefillStage {
     private let boundary: V4PrefillBoundary
     private let epilogue: V4QKVEpilogue
     private let qr: MTLBuffer
+    private let windowKVFloat: MTLBuffer
     private let positions: MTLBuffer
     private let repeatedHeadPositions: MTLBuffer
 
@@ -60,8 +61,14 @@ final class V4BatchedQKVCompressorPrefillStage {
         self.proj = try V4PrefillProj(device: device)
         self.boundary = try V4PrefillBoundary(device: device, maxRows: maxRows * Self.numQHeads)
         self.epilogue = try V4QKVEpilogue(device: device)
-        guard let qr = device.makeBuffer(length: maxRows * Self.qLoraRank * MemoryLayout<Float16>.stride,
+        // q_a and window_wkv GEMMs produce fp32 rows. RMSNorm then packs the
+        // normalized fp16 rows into the start of these scratch buffers before
+        // the next projection consumes them.
+        guard let qr = device.makeBuffer(length: maxRows * Self.qLoraRank * MemoryLayout<Float>.stride,
                                          options: .storageModeShared),
+              let windowKVFloat = device.makeBuffer(
+                length: maxRows * Self.headDim * MemoryLayout<Float>.stride,
+                options: .storageModeShared),
               let positions = device.makeBuffer(length: maxRows * MemoryLayout<Float>.stride,
                                                 options: .storageModeShared),
               let repeated = device.makeBuffer(length: maxRows * Self.numQHeads * MemoryLayout<Float>.stride,
@@ -69,9 +76,11 @@ final class V4BatchedQKVCompressorPrefillStage {
             throw MetalError.noDevice
         }
         qr.label = "v4batched-qkv.qr"
+        windowKVFloat.label = "v4batched-qkv.windowKVFloat"
         positions.label = "v4batched-qkv.positions"
         repeated.label = "v4batched-qkv.repeatedHeadPositions"
         self.qr = qr
+        self.windowKVFloat = windowKVFloat
         self.positions = positions
         self.repeatedHeadPositions = repeated
     }
@@ -133,11 +142,11 @@ final class V4BatchedQKVCompressorPrefillStage {
                            weights: weights.windowWKV.codes, weightsOffset: weights.windowWKVCodesOffset,
                            scales: weights.windowWKV.scales, scalesOffset: weights.windowWKVScalesOffset,
                            x: hiddenRows, xOffset: hiddenRowsOffset,
-                           out: outputs.windowKVOut, outOffset: outputs.windowKVOutOffset,
+                           out: windowKVFloat,
                            rows: rowCount, m: Self.headDim, n: Self.dim,
                            outFP16: false)
         boundary.encodeRMSNorm(commandBuffer: cb,
-                               x: outputs.windowKVOut, xOffset: outputs.windowKVOutOffset,
+                               x: windowKVFloat,
                                gamma: weights.kvNormGamma, gammaOffset: weights.kvNormGammaOffset,
                                out: outputs.windowKVOut, outOffset: outputs.windowKVOutOffset,
                                rows: rowCount, n: Self.headDim,
