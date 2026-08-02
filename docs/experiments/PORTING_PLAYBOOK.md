@@ -298,6 +298,20 @@ Validation ladder (`Scripts/v4f/longctx_ladder.py`), 2026-08-02:
 88/153/259-token levels all pass (0 failures), spanning window-only,
 CSA-active, and HCA-active regimes. CLI `--messages-file` works for
 V4 via DSML framing (`40ee2e1`).
+
+V4F-06 progress (2026-08-02): 06b grouped prefill MoE kernels landed
+(`3db4098`). 06a pipelined execution landed (`8ed20ac`): per-layer
+sync stalls removed (86 -> 41 waits/token), decode +23.5% tok/s, and a
+**pre-existing data race in the serial runner found and fixed** — the
+single slot-upload buffer was overwritten with the miss list while
+cb2's hit-subset could still be queued reading it, making greedy
+output nondeterministic run-to-run (4 distinct outputs across 4 runs).
+That race was the ladder level-4 "Spring" anomaly. Post-fix, two
+back-to-back 259-token runs are byte-identical; the "Spring" answer
+itself is deterministic model behavior (the prompt's flood sentence
+contains "when spring came", a distractor the greedy model takes at
+that exact length — with more context it answers "autumn"). Recorded
+as a model-quality note, not a pipeline bug.
 - **Drift RESOLVED (2026-08-02, diagnosis worker):** two runner
   composition bugs, both in `V4ForwardRunner.forward`, both
   per-token uniform (kernels and cache manager exonerated):
