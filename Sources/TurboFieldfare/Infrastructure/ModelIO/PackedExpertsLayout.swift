@@ -45,7 +45,11 @@ struct PackedExpertsLayout: Sendable {
 }
 
 enum PackedExpertsLayoutReader {
-    static let defaultMaxBytes: UInt64 = 16 * 1024 * 1024
+    /// Safety bound on layout.json metadata, not a format constraint.
+    /// V4-Flash layouts (256 experts x 43 layers x 6 sub-tensors) are
+    /// ~17.1 MB; 64 MB leaves headroom for larger expert pools while
+    /// still rejecting a corrupt or hostile file.
+    static let defaultMaxBytes: UInt64 = 64 * 1024 * 1024
 
     static func load(directoryURL: URL,
                             maxBytes: UInt64 = defaultMaxBytes) throws -> PackedExpertsLayout {

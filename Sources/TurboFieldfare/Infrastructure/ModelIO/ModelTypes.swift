@@ -106,6 +106,187 @@ public struct ArchConfig: Sendable, Equatable {
     }
 }
 
+/// Compile-time architecture baseline for DeepSeek V4-family installs
+/// (`manifest.json -> modelFamily == "deepseek-v4-flash"`, versionMinor 1).
+/// Field names mirror the flat DeepSeek `config.json` schema, which is what
+/// the V4 repacker writes into `manifest.json -> arch` (V4F-01). The runtime
+/// loader cross-checks every field at load time; mismatches throw
+/// `ModelError.archMismatch`. Separate type from `ArchConfig` so the Gemma
+/// gate stays byte-identical.
+public struct V4ArchConfig: Sendable, Equatable {
+    public let numLayers: Int
+    public let hiddenSize: Int
+    public let vocabSize: Int
+    public let numExperts: Int
+    public let numSharedExperts: Int
+    public let topKExperts: Int
+    public let moeIntermediateSize: Int
+    public let numHashLayers: Int
+    public let numMTPLayers: Int
+    public let numHeads: Int
+    public let numKVHeads: Int
+    public let headDim: Int
+    public let qLoraRank: Int
+    public let qkRopeHeadDim: Int
+    public let oGroups: Int
+    public let oLoraRank: Int
+    public let indexNHeads: Int
+    public let indexHeadDim: Int
+    public let indexTopk: Int
+    public let slidingWindow: Int
+    public let ropeTheta: Double
+    public let compressRopeTheta: Double
+    public let compressRatios: [Int]
+    public let routedScalingFactor: Double
+    public let swigluLimit: Double
+    public let normTopkProb: Bool
+    public let scoringFunc: String
+    public let topkMethod: String
+    public let hiddenActivation: String
+    public let hcMult: Int
+    public let hcEps: Double
+    public let hcSinkhornIters: Int
+    public let rmsNormEps: Double
+    public let tieWordEmbeddings: Bool
+    public let maxPositionEmbeddings: Int
+    public let yarnFactor: Double
+    public let yarnOriginalMaxPositions: Int
+    public let yarnBetaFast: Double
+    public let yarnBetaSlow: Double
+
+    public init(numLayers: Int, hiddenSize: Int, vocabSize: Int,
+                numExperts: Int, numSharedExperts: Int, topKExperts: Int,
+                moeIntermediateSize: Int, numHashLayers: Int, numMTPLayers: Int,
+                numHeads: Int, numKVHeads: Int, headDim: Int,
+                qLoraRank: Int, qkRopeHeadDim: Int, oGroups: Int,
+                oLoraRank: Int, indexNHeads: Int, indexHeadDim: Int,
+                indexTopk: Int, slidingWindow: Int,
+                ropeTheta: Double, compressRopeTheta: Double,
+                compressRatios: [Int], routedScalingFactor: Double,
+                swigluLimit: Double, normTopkProb: Bool,
+                scoringFunc: String, topkMethod: String,
+                hiddenActivation: String, hcMult: Int, hcEps: Double,
+                hcSinkhornIters: Int, rmsNormEps: Double,
+                tieWordEmbeddings: Bool, maxPositionEmbeddings: Int,
+                yarnFactor: Double, yarnOriginalMaxPositions: Int,
+                yarnBetaFast: Double, yarnBetaSlow: Double) {
+        self.numLayers = numLayers
+        self.hiddenSize = hiddenSize
+        self.vocabSize = vocabSize
+        self.numExperts = numExperts
+        self.numSharedExperts = numSharedExperts
+        self.topKExperts = topKExperts
+        self.moeIntermediateSize = moeIntermediateSize
+        self.numHashLayers = numHashLayers
+        self.numMTPLayers = numMTPLayers
+        self.numHeads = numHeads
+        self.numKVHeads = numKVHeads
+        self.headDim = headDim
+        self.qLoraRank = qLoraRank
+        self.qkRopeHeadDim = qkRopeHeadDim
+        self.oGroups = oGroups
+        self.oLoraRank = oLoraRank
+        self.indexNHeads = indexNHeads
+        self.indexHeadDim = indexHeadDim
+        self.indexTopk = indexTopk
+        self.slidingWindow = slidingWindow
+        self.ropeTheta = ropeTheta
+        self.compressRopeTheta = compressRopeTheta
+        self.compressRatios = compressRatios
+        self.routedScalingFactor = routedScalingFactor
+        self.swigluLimit = swigluLimit
+        self.normTopkProb = normTopkProb
+        self.scoringFunc = scoringFunc
+        self.topkMethod = topkMethod
+        self.hiddenActivation = hiddenActivation
+        self.hcMult = hcMult
+        self.hcEps = hcEps
+        self.hcSinkhornIters = hcSinkhornIters
+        self.rmsNormEps = rmsNormEps
+        self.tieWordEmbeddings = tieWordEmbeddings
+        self.maxPositionEmbeddings = maxPositionEmbeddings
+        self.yarnFactor = yarnFactor
+        self.yarnOriginalMaxPositions = yarnOriginalMaxPositions
+        self.yarnBetaFast = yarnBetaFast
+        self.yarnBetaSlow = yarnBetaSlow
+    }
+
+    /// Canonical DeepSeek V4-Flash baseline (43 layers, ratio 0 on 0/1, CSA ratio 4 on even
+    /// layers 2...42, HCA ratio 128 on odd layers 3...41).
+    public static let deepSeekV4Flash = V4ArchConfig(
+        numLayers: 43,
+        hiddenSize: 4096,
+        vocabSize: 129280,
+        numExperts: 256,
+        numSharedExperts: 1,
+        topKExperts: 6,
+        moeIntermediateSize: 2048,
+        numHashLayers: 3,
+        numMTPLayers: 1,
+        numHeads: 64,
+        numKVHeads: 1,
+        headDim: 512,
+        qLoraRank: 1024,
+        qkRopeHeadDim: 64,
+        oGroups: 8,
+        oLoraRank: 1024,
+        indexNHeads: 64,
+        indexHeadDim: 128,
+        indexTopk: 512,
+        slidingWindow: 128,
+        ropeTheta: 10_000.0,
+        compressRopeTheta: 160_000.0,
+        compressRatios: V4ArchConfig.flashCompressRatios(),
+        routedScalingFactor: 1.5,
+        swigluLimit: 10.0,
+        normTopkProb: true,
+        scoringFunc: "sqrtsoftplus",
+        topkMethod: "noaux_tc",
+        hiddenActivation: "silu",
+        hcMult: 4,
+        hcEps: 1e-6,
+        hcSinkhornIters: 20,
+        rmsNormEps: 1e-6,
+        tieWordEmbeddings: false,
+        maxPositionEmbeddings: 1_048_576,
+        yarnFactor: 16.0,
+        yarnOriginalMaxPositions: 65_536,
+        yarnBetaFast: 32.0,
+        yarnBetaSlow: 1.0)
+
+    private static func flashCompressRatios() -> [Int] {
+        (0..<43).map { layer in
+            if layer < 2 { return 0 }
+            return layer % 2 == 0 ? 4 : 128
+        }
+    }
+
+    /// Per-layer attention variant from `compressRatios` (0 = passthrough
+    /// sliding window, 4 = CSA, 128 = HCA), matching `V4CacheConfig.kind`.
+    public func layerKind(_ layer: Int) -> V4LayerKind {
+        switch compressRatios[layer] {
+        case 4:   return .csa
+        case 128: return .hca
+        default:  return .passthrough
+        }
+    }
+
+    /// True for layers 0..<numHashLayers: expert ids come from the fixed
+    /// `tid2eid` table (no router selection kernel, no bias tensor).
+    public func isHashRouted(layer: Int) -> Bool {
+        layer < numHashLayers
+    }
+
+    /// Cache geometry for `CompressedKVCacheManager`.
+    public var cacheConfig: V4CacheConfig {
+        V4CacheConfig(compressRatios: compressRatios,
+                      headDim: headDim,
+                      ropeDim: qkRopeHeadDim,
+                      window: slidingWindow,
+                      numQHeads: numHeads)
+    }
+}
+
 /// Failure modes for the validation gates in `Model.load`.
 enum ModelError: Error, CustomStringConvertible, Equatable {
     case partialInstall(path: String)
@@ -122,6 +303,7 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case indexCorrupt(detail: String)
     case posixFailed(call: String, errno: Int32)
     case trustedReceiptInvalid(detail: String)
+    case unsupportedModelFamily(found: String)
 
     public var description: String {
         switch self {
@@ -153,6 +335,8 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "\(c) failed with errno \(e)"
         case .trustedReceiptInvalid(let detail):
             return "trusted install receipt invalid: \(detail)"
+        case .unsupportedModelFamily(let found):
+            return "manifest modelFamily \"\(found)\" is not supported by this loader"
         }
     }
 }

@@ -17,7 +17,11 @@ public func run(args: Args,
                 stderr: FileHandle = .standardError) async -> RunResult {
     do {
         let modelURL = URL(fileURLWithPath: args.model)
-        let tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
+        let v4Family = (try? ManifestReader.probeModelFamily(directoryURL: modelURL))
+            == ManifestReader.deepSeekV4FlashFamily
+        let tokenizer = v4Family
+            ? try await GFTokenizer.loadV4(forModelDirectory: modelURL)
+            : try await GFTokenizer.load(forModelDirectory: modelURL)
         let promptIds: [Int32]
         if let rawPrompt = args.prompt {
             promptIds = tokenizer.encode(rawPrompt, addBOS: true)
@@ -25,14 +29,26 @@ public func run(args: Args,
             let data = try Data(contentsOf: URL(fileURLWithPath: messagesFile),
                                 options: [.mappedIfSafe])
             let rows = try JSONDecoder().decode([MessageJSON].self, from: data)
-            let messages = try rows.map { row -> GFTokenizer.Message in
-                guard let role = GFTokenizer.Role(rawValue: row.role) else {
-                    throw GFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
+            if v4Family {
+                let v4Messages = try rows.map { row -> V4Message in
+                    guard let role = V4Role(rawValue: row.role) else {
+                        throw GFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
+                    }
+                    return V4Message(role: role, content: row.content)
                 }
-                return GFTokenizer.Message(role: role, content: row.content)
+                let rendered = try V4ChatFormat.encodeMessages(v4Messages,
+                                                               thinkingMode: .chat)
+                promptIds = tokenizer.encode(rendered, addBOS: false)
+            } else {
+                let messages = try rows.map { row -> GFTokenizer.Message in
+                    guard let role = GFTokenizer.Role(rawValue: row.role) else {
+                        throw GFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
+                    }
+                    return GFTokenizer.Message(role: role, content: row.content)
+                }
+                let rendered = try tokenizer.applyChatTemplate(messages)
+                promptIds = tokenizer.encode(rendered, addBOS: false)
             }
-            let rendered = try tokenizer.applyChatTemplate(messages)
-            promptIds = tokenizer.encode(rendered, addBOS: false)
         } else {
             return errored(stderr, "one of --prompt or --messages-file is required", 2)
         }
@@ -53,6 +69,15 @@ public func run(args: Args,
             seed: args.seed,
             stopStrings: args.stops,
             extraStopTokens: [])
+        if v4Family {
+            return await runV4(args: args,
+                               modelURL: modelURL,
+                               tokenizer: tokenizer,
+                               promptIds: promptIds,
+                               config: config,
+                               stdout: stdout,
+                               stderr: stderr)
+        }
         let runtime = RuntimeConfiguration(
             forceLogitsHead: !config.isPureGreedy)
 
@@ -107,7 +132,7 @@ public func run(args: Args,
     }
 }
 
-private func errored(_ stderr: FileHandle, _ message: String, _ code: Int32) -> RunResult {
+func errored(_ stderr: FileHandle, _ message: String, _ code: Int32) -> RunResult {
     stderr.write(Data("error: \(message)\n".utf8))
     return RunResult(exitCode: code)
 }

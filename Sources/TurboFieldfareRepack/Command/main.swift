@@ -3,15 +3,17 @@ import TurboFieldfareRepackCore
 
 private let usage = """
 Usage:
-  TurboFieldfareRepack --output <model.gturbo> [--overwrite] [--resume]
+  TurboFieldfareRepack --output <model.gturbo> [--model <gemma4|v4flash>] [--overwrite] [--resume]
   TurboFieldfareRepack --discard-partial --output <model.gturbo>
   TurboFieldfareRepack --verify-install --input-gturbo <model.gturbo>
   TurboFieldfareRepack --help
 
-The installer streams the supported Gemma 4 checkpoint from Hugging Face and
-repackages it without materializing the source checkpoint on disk. Set HF_TOKEN
-only if Hugging Face requests authentication. A cancelled or interrupted
-download can be continued with --resume or removed with --discard-partial.
+The installer streams a supported checkpoint from Hugging Face and repackages
+it without materializing the source checkpoint on disk. --model selects the
+checkpoint: gemma4 (Gemma 4 26B-A4B IT 4-bit, default, ~15 GB) or v4flash
+(DeepSeek V4-Flash, ~155 GB). Set HF_TOKEN only if Hugging Face requests
+authentication. A cancelled or interrupted download can be continued with
+--resume or removed with --discard-partial.
 """
 
 private struct Arguments {
@@ -21,6 +23,7 @@ private struct Arguments {
     var discardPartial = false
     var verifyInstall = false
     var inputGTurbo: String?
+    var modelKey = SupportedModelSource.default.key
 
     static func parse(_ values: [String]) throws -> Arguments {
         var parsed = Arguments()
@@ -42,14 +45,21 @@ private struct Arguments {
             case "--verify-install":
                 parsed.verifyInstall = true
                 index += 1
-            case "--output", "--input-gturbo":
+            case "--output", "--input-gturbo", "--model":
                 guard index + 1 < values.count else {
                     throw ParseError.missingValue(flag)
                 }
                 if flag == "--output" {
                     parsed.output = values[index + 1]
-                } else {
+                } else if flag == "--input-gturbo" {
                     parsed.inputGTurbo = values[index + 1]
+                } else {
+                    let key = values[index + 1]
+                    guard SupportedModelSource.descriptor(forKey: key) != nil else {
+                        let known = SupportedModelSource.all.map(\.key).joined(separator: "|")
+                        throw ParseError.invalidMode("unknown --model \(key) (expected \(known))")
+                    }
+                    parsed.modelKey = key
                 }
                 index += 2
             default:
@@ -146,15 +156,16 @@ private func run(_ values: [String]) async -> Int32 {
         }
     }
 
-    guard let output = arguments.output else { return 2 }
-    let options = SupportedModelSource.installOptions(
+    guard let output = arguments.output,
+          let descriptor = SupportedModelSource.descriptor(forKey: arguments.modelKey) else { return 2 }
+    let options = descriptor.installOptions(
         outputDirectory: URL(fileURLWithPath: output),
         overwrite: arguments.overwrite,
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],
         resume: arguments.resume)
     do {
         let result = try await RemoteStreamingRepacker(options: options).run()
-        print("Installed \(SupportedModelSource.displayName)")
+        print("Installed \(descriptor.displayName)")
         print("Source revision: \(result.resolvedCommit)")
         print("Model: \(result.outputDir)")
         return 0

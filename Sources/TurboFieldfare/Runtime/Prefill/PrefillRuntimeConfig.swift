@@ -97,7 +97,7 @@ enum PrefillChunkPlanner {
                              chunkTokens: Int) -> [PrefillChunkSpan] {
         precondition(tokenCount >= 0, "prefill tokenCount must be non-negative")
         precondition(startPosition >= 0, "prefill startPosition must be non-negative")
-        let chunk = max(1, min(chunkTokens, PrefillRuntimeConfig.maxChunkTokens))
+        let chunk = max(1, min(chunkTokens, PrefillRuntimeConfig.absoluteMaxChunkTokens))
         guard tokenCount > 0 else { return [] }
 
         var spans: [PrefillChunkSpan] = []
@@ -169,6 +169,7 @@ public struct PrefillRuntimeConfig: Sendable, Equatable {
     }
 
     public static let maxChunkTokens = 128
+    public static let absoluteMaxChunkTokens = 256
 
     public let mode: Mode
     public let chunkTokens: Int
@@ -191,6 +192,15 @@ public struct PrefillRuntimeConfig: Sendable, Equatable {
     public static func production(chunkTokens: Int) -> PrefillRuntimeConfig {
         precondition(RuntimeConfiguration.allowedPrefillChunkTokens.contains(chunkTokens),
                      "unsupported prefill chunk size")
+        return PrefillRuntimeConfig(mode: .chunked, chunkTokens: chunkTokens)
+    }
+
+    /// V4's row-wise causal executor can safely span more than its 128-token
+    /// sliding window. Keep this separate from the public Gemma controls,
+    /// whose scratch layout remains capped at 128 rows.
+    public static func v4Production(chunkTokens: Int) -> PrefillRuntimeConfig {
+        precondition([32, 64, 128, 256].contains(chunkTokens),
+                     "unsupported V4 prefill chunk size")
         return PrefillRuntimeConfig(mode: .chunked, chunkTokens: chunkTokens)
     }
 }

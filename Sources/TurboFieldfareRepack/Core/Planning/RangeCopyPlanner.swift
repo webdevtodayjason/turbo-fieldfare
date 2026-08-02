@@ -77,10 +77,10 @@ public enum RangeCopyPlanner {
             for expert in 0..<layer.expertsPerLayer {
                 let blobBase = UInt64(layer.physicalRank(for: expert)) * layer.expertStride
                 for slice in layer.subTensors {
+                    let source = slice.source(forExpert: expert)
                     copies.append(RangeCopy(
-                        shardID: slice.sourceTensor.shardPath,
-                        sourceOffset: slice.sourceTensor.absoluteOffset
-                            + UInt64(expert) * slice.sourceOffsetPerExpert,
+                        shardID: source.shardPath,
+                        sourceOffset: source.absoluteOffset,
                         size: slice.sizeInExpertBlob,
                         destinationPath: layer.path,
                         destinationOffset: blobBase + slice.offsetInExpertBlob))

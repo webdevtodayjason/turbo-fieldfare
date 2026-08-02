@@ -2,7 +2,7 @@ import Foundation
 
 struct RemoteSnapshot {
     let metadata: IndexLoader.SourceMetadata
-    let arch: ArchInfo
+    let arch: PlanArch
     let shardHeaders: [Safetensors.Header]
     let remoteFiles: [String: RemoteFileInfo]
     let resolvedCommit: String
@@ -25,9 +25,11 @@ enum RemoteSnapshotLoader {
             throw RepackError.remoteProtocolInvalid(detail: "config commit differs from index commit")
         }
 
+        // V4-Flash's weight_map has ~70k entries (~15 MB); the Gemma index is
+        // ~200 KB. 64 MB keeps the cap deliberate rather than runtime-discovered.
         try await pinned.fetchSmallFile(filename: "model.safetensors.index.json",
                                         info: indexInfo,
-                                        capBytes: 4 * 1024 * 1024,
+                                        capBytes: 64 * 1024 * 1024,
                                         outputPath: (metadataDirectory as NSString)
                                             .appendingPathComponent("model.safetensors.index.json"),
                                         audit: audit)
@@ -43,7 +45,7 @@ enum RemoteSnapshotLoader {
             throw RepackError.sourceFingerprintRejected(path: metadata.indexPath,
                                                         sha256: metadata.indexSha256Hex)
         }
-        let arch = try ArchInfo.load(configPath: metadata.configPath)
+        let arch = try PlanArch.load(configPath: metadata.configPath, family: metadata.family)
 
         var files: [String: RemoteFileInfo] = [
             indexInfo.filename: indexInfo,

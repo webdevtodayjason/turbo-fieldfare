@@ -24,6 +24,14 @@ import Testing
         #expect(spans.map(\.startPosition) == [7, 71, 135])
     }
 
+    @Test func v4CanUseOneChunkBeyondTheSlidingWindow() {
+        let config = PrefillRuntimeConfig.v4Production(chunkTokens: 256)
+        let spans = PrefillChunkPlanner.spans(tokenCount: 231,
+                                              startPosition: 0,
+                                              config: config)
+        #expect(spans.map(\.tokenCount) == [231])
+    }
+
     @Test func diagnosticsPreserveUnknownValues() {
         let diagnostics = PrefillExecutionDiagnostics(
             config: .production(chunkTokens: 128),

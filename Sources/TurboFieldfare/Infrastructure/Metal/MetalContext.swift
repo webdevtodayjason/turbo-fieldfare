@@ -56,8 +56,14 @@ public final class MetalContext: @unchecked Sendable {
     private var pipelineCache: [PipelineCacheKey: MTLComputePipelineState] = [:]
     private let pipelineCacheLock = NSLock()
 
-    public init() throws {
+    public convenience init() throws {
         guard let dev = MTLCreateSystemDefaultDevice() else { throw MetalError.noDevice }
+        try self.init(device: dev)
+    }
+
+    /// Context bound to a specific device (used by `V4ShaderLibrary`'s
+    /// shared-context cache so device-keyed wrappers get context pipelines).
+    public init(device dev: MTLDevice) throws {
         guard let q   = dev.makeCommandQueue()           else { throw MetalError.noQueue }
         self.device  = dev
         self.queue   = q
@@ -76,17 +82,51 @@ public final class MetalContext: @unchecked Sendable {
         "utility",
         "fused",
         "prefill",
+        // V4-Flash modules (V4F-02/03/04). All V4 kernels live in
+        // `v4*_`-prefixed namespaces and collide with nothing in the
+        // modules above (or with each other); the V4 wrappers take their
+        // pipelines from this context via `V4ShaderLibrary`'s shared-context
+        // delegate or `context.pipeline(...)` directly.
+        "dequant_v4",
+        "moe_v4",
+        "attention_v4",
+        // Wave-2 boundary kernels (RoPE, mHC, HCA compressor, rmsnorm,
+        // grouped/f32 GEMVs) and the V4F-04 decode-graph glue (shared-expert
+        // SwiGLU, embed broadcast, indexer compressor flush, fp32->fp16
+        // norm, hash-layer routing weights).
+        "attention_v4b",
+        "attention_v4c",
+        // V4F-06b grouped routed-MoE prefill (FP4 + clamped SwiGLU).
+        "prefill_moe_v4",
+        // V4F-06c-A1 batched prefill boundary (mHC, norms, RoPE).
+        "prefill_boundary_v4",
+        // V4F-06c-A2 batched prefill projections, window attention, o-proj.
+        "prefill_proj_v4",
+        // V4F-06c glue kernels for chunked prefill orchestration.
+        "prefill_chunked_glue_v4",
+        // Hook: sibling wave work adds more V4 modules. Register them by
+        // appending the name here plus one row in `shaderSubdirectories`
+        // below; no other call-site change is needed.
     ]
 
     /// Bundle locations for runtime shader modules.
     private static let shaderSubdirectories: [String: String] = [
         "attention": "Metal/Attention",
+        "attention_v4": "Metal/Attention",
+        "attention_v4b": "Metal/Attention",
+        "attention_v4c": "Metal/Attention",
         "dequant_int4": "Metal/Quant",
         "dequant_int8": "Metal/Quant",
+        "dequant_v4": "Metal/Quant",
         "fused": "Metal/Fusions",
         "logit": "Metal/Sampling",
         "moe": "Metal/MoE",
+        "moe_v4": "Metal/MoE",
         "prefill": "Metal/Prefill",
+        "prefill_moe_v4": "Metal/Prefill",
+        "prefill_boundary_v4": "Metal/Prefill",
+        "prefill_proj_v4": "Metal/Prefill",
+        "prefill_chunked_glue_v4": "Metal/Prefill",
         "rmsnorm": "Metal/Primitives",
         "rope": "Metal/Primitives",
         "tensorops": "Metal/TensorCore",

@@ -91,6 +91,20 @@ public struct GFTokenizer: @unchecked Sendable {
         return try GFTokenizer(tokenizer: underlying)
     }
 
+    /// Load a DeepSeek V4-family tokenizer from a `.gturbo` model directory.
+    /// Same underlying BPE loader; the wrapper init requires only BOS/EOS
+    /// and leaves the Gemma-only marker IDs unset. The Gemma init above is
+    /// unchanged.
+    public static func loadV4(forModelDirectory modelDirectory: URL,
+                              environment: [String: String] = ProcessInfo.processInfo.environment) async throws -> GFTokenizer {
+        guard let folder = tokenizerFolder(forModelDirectory: modelDirectory,
+                                           environment: environment) else {
+            throw GFTokenizerError.missingSpecialToken("tokenizer/ sidecar")
+        }
+        let underlying = try await AutoTokenizer.from(modelFolder: folder.standardizedFileURL)
+        return try GFTokenizer(v4Tokenizer: underlying)
+    }
+
     private static func hasTokenizerJSON(in folder: URL, fileManager: FileManager) -> Bool {
         fileManager.fileExists(atPath: folder.appendingPathComponent("tokenizer.json").path)
     }
@@ -133,6 +147,32 @@ public struct GFTokenizer: @unchecked Sendable {
         self.channelEndID = Int32(channelEnd)
         self.stopTokenIDs = [self.eosID, self.endOfTurnID, self.toolResponseID]
         self.vocabSize = 262_144
+    }
+
+    /// DeepSeek V4-family wrapper. Requires only BOS/EOS from the
+    /// checkpoint tokenizer; Gemma-only marker IDs are set to -1 (never
+    /// emitted by the V4 decode path) and the stop set is EOS alone. V4
+    /// chat/tool framing lives in `V4ChatFormat` / `V4ToolCallParser`.
+    public init(v4Tokenizer underlying: any Tokenizer) throws {
+        self.tokenizer = underlying
+        guard let bos = underlying.bosTokenId else {
+            throw GFTokenizerError.missingSpecialToken("<bos>")
+        }
+        guard let eos = underlying.eosTokenId else {
+            throw GFTokenizerError.missingSpecialToken("<eos>")
+        }
+        self.bosID = Int32(bos)
+        self.eosID = Int32(eos)
+        self.padID = -1
+        self.endOfTurnID = -1
+        self.toolCallStartID = -1
+        self.toolCallEndID = -1
+        self.toolResponseID = -1
+        self.toolResponseEndID = -1
+        self.channelStartID = -1
+        self.channelEndID = -1
+        self.stopTokenIDs = [self.eosID]
+        self.vocabSize = 129_280
     }
 
     /// Encode UTF-8 text to token IDs. `addBOS = true` prepends `<bos>`.
