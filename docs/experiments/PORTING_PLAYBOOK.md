@@ -206,6 +206,30 @@ Implementation status (branch `v4f`, 2026-08-01):
   o-projection, Q/KV LoRA epilogue, HCA compressor kernel, prefill
   paths, tokenizer/DSML chat format, then V4F-04 runtime wiring.
 
+Wave 2+ status update (2026-08-01/02, branch `v4f`):
+
+- Wave 2 landed: RoPE/mHC/HCA/o-proj kernels (`2e26285`), tokenizer and
+  DSML chat format (`4a5f161`), MetalContext registration and the V4
+  family arch gate + V4Model (`a4b23fa`, `2208ab9`).
+- **V4F-04 decode runner landed** (`c418240`): `V4ForwardRunner`
+  composes all kernels into the per-token graph with cb1/io/cb2 phasing.
+  v1 serializes layers to preserve slot ownership; cross-layer
+  pipelining is the recorded follow-up. Coordinator-written after three
+  worker deaths (Kimi K3 API stream timeouts, not task failures).
+- **Option C gate PASSED** (`scripts/v4f/make_v4f_golden.py` +
+  `Tests/.../V4RealCheckpointValidationTests.swift`): GPU kernels vs
+  independent numpy goldens on 61.6 MB of real shard-7 bytes. FP4/FP8
+  GEMVs at the fp16 output floor (max rel err 4e-4), router top-6
+  selection exact, fused MoE within 4e-4, embed lookup exact. Format
+  interpretation (low-nibble e2m1, ue8m0 scales, OCP e4m3) confirmed
+  against real weights. Full report: `scratch/v4f-recon/validation-report.md`.
+- First real-download attempt caught a planner-adjacent bug: the
+  published config carries 44 compress_ratios (43 layers + 1 MTP).
+  Fixed in `6dd6b66`.
+- Full ~155 GB repack launched 2026-08-02 (background, resumable).
+  Next gates: first-token validation vs the reference, then V4F-05
+  holdouts. Prefill (V4F-06) and cross-layer pipelining remain open.
+
 De-risking findings:
 
 - **cb1/cb2 survives.** CSA top-512 selection touches only GPU-resident
