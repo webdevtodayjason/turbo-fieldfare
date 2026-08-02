@@ -505,10 +505,13 @@ void v4_csa_compress_group(
     x[d] = acc * rsqrt(sq / float(HD) + norm_eps) * gamma[d];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Partial RoPE on the trailing 64 dims: slice-local pair i rotates
-    // channels (448 + i, 448 + 32 + i) at the group-start position.
+    // Partial RoPE on the trailing 64 dims, interleaved (adjacent-pair)
+    // convention matching the reference: pair i covers slice elements
+    // (2i, 2i+1), i.e. channels (448+2i, 448+2i+1).
     if (d >= kV4NonRopeDim && d < kV4NonRopeDim + kV4RopeDim / 2) {
         const uint i = d - kV4NonRopeDim;
+        const uint i0 = kV4NonRopeDim + 2u * i;
+        const uint i1 = i0 + 1u;
         const float freq = use_yarn != 0u
             ? v4_yarn_freq(i, rope_theta, yarn_factor, orig_seq_len,
                            beta_fast, beta_slow)
@@ -516,10 +519,10 @@ void v4_csa_compress_group(
         const float angle = float(rope_position) * freq;
         const float cs = cos(angle);
         const float sn = sin(angle);
-        const float x0 = x[d];
-        const float x1 = x[d + kV4RopeDim / 2];
-        x[d]                    = x0 * cs - x1 * sn;
-        x[d + kV4RopeDim / 2]   = x0 * sn + x1 * cs;
+        const float x0 = x[i0];
+        const float x1 = x[i1];
+        x[i0] = x0 * cs - x1 * sn;
+        x[i1] = x0 * sn + x1 * cs;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

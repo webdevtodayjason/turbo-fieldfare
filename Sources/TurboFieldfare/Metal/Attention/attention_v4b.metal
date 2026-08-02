@@ -176,8 +176,13 @@ kernel void v4b_rope_trailing(
     const float angle = position * freq;
     const float cs = cos(angle);
     const float sn = inverse != 0u ? -sin(angle) : sin(angle);
-    const uint i0 = base + i;
-    const uint i1 = base + half_rope + i;
+    // Interleaved (adjacent-pair) convention, matching the reference
+    // apply_rotary_emb: x.unflatten(-1, (-1, 2)) -> view_as_complex, so
+    // pair i covers elements (2i, 2i+1) of the rope slice. An earlier
+    // half-split pairing (i, i + half_rope) garbled all distance-dependent
+    // attention while leaving same-position scores intact.
+    const uint i0 = base + 2u * i;
+    const uint i1 = base + 2u * i + 1u;
     const float x0 = float(X[i0]);
     const float x1 = float(X[i1]);
     X[i0] = half(x0 * cs - x1 * sn);
@@ -425,17 +430,20 @@ void v4b_hca_compress_group(
 
     // Partial RoPE on the trailing 64 dims at the group-start position.
     if (d >= kV4bNonRopeDim && d < kV4bNonRopeDim + kV4bRopeDim / 2) {
+        // Interleaved (adjacent-pair) convention; see v4b_rope_trailing.
         const uint i = d - kV4bNonRopeDim;
+        const uint i0 = kV4bNonRopeDim + 2u * i;
+        const uint i1 = i0 + 1u;
         const float freq = v4b_rope_freq(i, rope_theta, yarn_factor,
                                          orig_seq_len, beta_fast, beta_slow,
                                          use_yarn);
         const float angle = float(rope_position) * freq;
         const float cs = cos(angle);
         const float sn = sin(angle);
-        const float x0 = x[d];
-        const float x1 = x[d + kV4bRopeDim / 2];
-        x[d]                  = x0 * cs - x1 * sn;
-        x[d + kV4bRopeDim / 2] = x0 * sn + x1 * cs;
+        const float x0 = x[i0];
+        const float x1 = x[i1];
+        x[i0] = x0 * cs - x1 * sn;
+        x[i1] = x0 * sn + x1 * cs;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

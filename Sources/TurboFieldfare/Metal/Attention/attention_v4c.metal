@@ -239,7 +239,10 @@ kernel void v4c_indexer_compress_group(
     // Partial RoPE on the trailing 64 dims at the group-start position.
     constexpr uint rope_base = HD - 64;
     if (d >= rope_base && d < rope_base + 32) {
+        // Interleaved (adjacent-pair) convention; see v4b_rope_trailing.
         const uint i = d - rope_base;
+        const uint i0 = rope_base + 2u * i;
+        const uint i1 = i0 + 1u;
         const float freq = use_yarn != 0u
             ? v4c_yarn_freq(i, rope_theta, yarn_factor, orig_seq_len,
                             beta_fast, beta_slow, 64u)
@@ -247,10 +250,10 @@ kernel void v4c_indexer_compress_group(
         const float angle = float(rope_position) * freq;
         const float cs = cos(angle);
         const float sn = sin(angle);
-        const float x0 = x[d];
-        const float x1 = x[d + 32];
-        x[d]      = x0 * cs - x1 * sn;
-        x[d + 32] = x0 * sn + x1 * cs;
+        const float x0 = x[i0];
+        const float x1 = x[i1];
+        x[i0] = x0 * cs - x1 * sn;
+        x[i1] = x0 * sn + x1 * cs;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

@@ -96,14 +96,16 @@ import TurboFieldfareValidationSupport
         let ms = x.reduce(0) { $0 + $1 * $1 } / Float(headDim)
         let inv = 1 / (ms + 1e-6).squareRoot()
         for d in 0..<headDim { x[d] = x[d] * inv * gamma[d] }
-        // Partial RoPE on the trailing 64 dims (slice pairs (448+i, 480+i))
-        // at the group-start position, compress theta + YaRN.
+        // Partial RoPE on the trailing 64 dims, interleaved (adjacent-pair)
+        // convention matching the official reference: slice pair i covers
+        // elements (448+2i, 448+2i+1), rotated at the group-start position
+        // with compress theta + YaRN.
         for i in 0..<32 {
             let angle = Float(ropePosition) * yarnFreq(i)
             let cs = cos(angle), sn = sin(angle)
-            let x0 = x[448 + i], x1 = x[448 + 32 + i]
-            x[448 + i] = x0 * cs - x1 * sn
-            x[448 + 32 + i] = x0 * sn + x1 * cs
+            let x0 = x[448 + 2 * i], x1 = x[448 + 2 * i + 1]
+            x[448 + 2 * i] = x0 * cs - x1 * sn
+            x[448 + 2 * i + 1] = x0 * sn + x1 * cs
         }
         return x
     }

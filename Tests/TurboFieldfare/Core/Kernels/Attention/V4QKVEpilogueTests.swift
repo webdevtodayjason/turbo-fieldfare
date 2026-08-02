@@ -70,9 +70,9 @@ import TurboFieldfareValidationSupport
             for i in 0..<32 {
                 let angle = position * yarnFreq(i)
                 let cs = cos(angle), sn = sin(angle)
-                let x0 = x[base + i], x1 = x[base + 32 + i]
-                x[base + i] = x0 * cs - x1 * sn
-                x[base + 32 + i] = x0 * sn + x1 * cs
+                let x0 = x[base + 2 * i], x1 = x[base + 2 * i + 1]
+                x[base + 2 * i] = x0 * cs - x1 * sn
+                x[base + 2 * i + 1] = x0 * sn + x1 * cs
             }
         }
         return x

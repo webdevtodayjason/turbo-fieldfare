@@ -57,9 +57,9 @@ import TurboFieldfareValidationSupport
         for i in 0..<32 {
             let angle = Float(ropePosition) * yarnFreq(i)
             let cs = cos(angle), sn = sin(angle)
-            let x0 = x[448 + i], x1 = x[448 + 32 + i]
-            x[448 + i] = x0 * cs - x1 * sn
-            x[448 + 32 + i] = x0 * sn + x1 * cs
+            let x0 = x[448 + 2 * i], x1 = x[448 + 2 * i + 1]
+            x[448 + 2 * i] = x0 * cs - x1 * sn
+            x[448 + 2 * i + 1] = x0 * sn + x1 * cs
         }
         return x
     }

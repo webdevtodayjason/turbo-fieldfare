@@ -54,13 +54,15 @@ import TurboFieldfareValidationSupport
         let half = ropeDim / 2
         for r in 0..<rows {
             let base = r * width + (width - ropeDim)
+            // Interleaved (adjacent-pair) convention, matching the
+            // official reference apply_rotary_emb.
             for i in 0..<half {
                 let angle = position * freq(i, config: config)
                 let cs = cos(angle)
                 let sn = inverse ? -sin(angle) : sin(angle)
-                let x0 = x[base + i], x1 = x[base + half + i]
-                x[base + i] = x0 * cs - x1 * sn
-                x[base + half + i] = x0 * sn + x1 * cs
+                let x0 = x[base + 2 * i], x1 = x[base + 2 * i + 1]
+                x[base + 2 * i] = x0 * cs - x1 * sn
+                x[base + 2 * i + 1] = x0 * sn + x1 * cs
             }
         }
         return x
