@@ -259,6 +259,31 @@ First-token debugging dossier (2026-08-02, branch `v4f`):
   (4) mHC boundary details. Evidence: BOS stream explodes (4 -> 8000
   rms) while normal tokens stay small (~0.17), consistent with
   massive-activation literature and possibly all correct.
+
+RESOLVED 2026-08-02 (`8fffb1a`, `676731b`). Three composition bugs,
+all in runner/wiring, kernels innocent throughout:
+
+1. Output de-rotation double negation (`-position` AND `inverse:true`;
+  the kernel's inverse already conjugates). One line.
+2. Grouped o-projection run as one flat GEMV; 7/8 groups read the
+  wrong input slice. Fixed with per-group offsets.
+3. **RoPE pairing convention** (the long-context killer): the
+  reference's `apply_rotary_emb` uses `unflatten(-1, (-1, 2))` +
+  `view_as_complex` — adjacent pairs, interleaved convention. All four
+  V4 RoPE sites used NeoX half-split pairs. Same-position scores are
+  invariant under any consistent rotation, so short prompts and every
+  self-consistent CPU-reference test passed while distance-dependent
+  retrieval garbled. Lesson recorded: kernel tests whose CPU reference
+  is written from the same assumption as the kernel cannot catch
+  convention errors; the feasibility screen now treats one
+  end-to-end real-weights run as a mandatory gate before any
+  convention-sensitive claim.
+
+Validation after the fix (greedy, temp 0): 6-token France prompt
+non-repetitive and correct; 57-token story QA answers "Autumn" and
+quotes the exact evidence sentence; 231-token story QA answers
+correctly with the CSA compressed path active. 122/122 tests green
+(test CPU references updated to the interleaved convention).
 - **Drift RESOLVED (2026-08-02, diagnosis worker):** two runner
   composition bugs, both in `V4ForwardRunner.forward`, both
   per-token uniform (kernels and cache manager exonerated):
