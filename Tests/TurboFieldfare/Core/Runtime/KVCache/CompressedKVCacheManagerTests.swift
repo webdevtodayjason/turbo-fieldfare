@@ -27,7 +27,9 @@ import TurboFieldfareValidationSupport
         #expect(config.numLayers == 43)
         #expect(config.kind(layer: 0) == .passthrough)
         #expect(config.kind(layer: 1) == .passthrough)
-        #expect(config.kind(layer: 42) == .passthrough)
+        // The trailing 0 in the published 44-entry compress_ratios belongs
+        // to the dropped MTP module; layer 42 is even, hence CSA.
+        #expect(config.kind(layer: 42) == .csa)
         #expect(config.kind(layer: 2) == .csa)
         #expect(config.kind(layer: 3) == .hca)
         #expect(config.kind(layer: 40) == .csa)
