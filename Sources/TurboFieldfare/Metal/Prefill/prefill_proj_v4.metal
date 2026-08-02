@@ -24,7 +24,8 @@ using namespace metal;
 //                           CompressedKVCacheManager.windowSlot addressing.
 //   v4pp_window_mqa_prefill batched causal window MQA: 64 q heads x 512,
 //                           per-head sinks in the DENOMINATOR only (not the
-//                           max), row i attends ring[0..prefix) + chunk[0..i].
+//                           max), row i attends exactly the last 128 logical
+//                           tokens from ring prefix + chunk[0..i].
 //                           FP16 in/out.
 //   v4pp_fp8_grouped_gemm   grouped o-proj down stage: 8 groups, y[r, g*R+i]
 //                           = dot(W[g*R+i, :], x[r, g*D .. +D]). NOT a flat
@@ -229,10 +230,11 @@ kernel void v4pp_window_ring_write(
 // ----------------------------------------------------------------------------
 // v4pp_window_mqa_prefill — batched causal window MQA with per-head sinks.
 //
-// Row i attends exactly ring[0 .. prefix) followed by chunk rows [0 .. i]
-// (self included): the ring prefix holds the tokens already flushed by
-// earlier chunks at slots 0..prefix-1, and the current chunk's KV stays in
-// its staging rows so future rows are never visible. K == V (shared MQA),
+// Row i attends exactly the last 128 logical tokens among the already-flushed
+// prefix and chunk rows [0 .. i] (self included). The prefix ring holds
+// min(prefix, window) logical tokens, with its oldest visible token at
+// `ringStart`; current chunk KV stays in staging rows so future rows are never
+// visible. K == V (shared MQA),
 // head_dim 512, 64 query heads. Sinks enter the DENOMINATOR only and are NOT
 // in the running max, matching v4_sink_combine semantics (recon ambiguity
 // #3): out = acc / (d_run + exp(sink[h] - m_run)).
@@ -242,12 +244,13 @@ kernel void v4pp_window_ring_write(
 [[kernel, max_total_threads_per_threadgroup(kV4PPThreads)]]
 void v4pp_window_mqa_prefill(
     device const half*  Q       [[buffer(0)]],   // [rows, 64, 512]
-    device const half*  ringK   [[buffer(1)]],   // [window, 512], prefix at slots [0, prefix)
+    device const half*  ringK   [[buffer(1)]],   // [128, 512], wrapped prefix ring
     device const half*  chunkKV [[buffer(2)]],   // [rows, 512]
     device const float* sinks   [[buffer(3)]],   // [64] fp32
     device half*        out     [[buffer(4)]],   // [rows, 64, 512]
     constant uint&      prefix  [[buffer(5)]],
-    constant float&     scale   [[buffer(6)]],
+    constant uint&      ringStart [[buffer(6)]], // physical slot of oldest prefix token
+    constant float&     scale   [[buffer(7)]],
     uint tg_id           [[threadgroup_position_in_grid]],
     uint lid             [[thread_position_in_threadgroup]],
     uint lsize           [[threads_per_threadgroup]],
@@ -274,11 +277,21 @@ void v4pp_window_mqa_prefill(
     float m_run = -INFINITY;
     float d_run = 0.0f;
 
+    constexpr uint WINDOW = 128;
     const uint total = prefix + row + 1u;
-    for (uint e = 0; e < total; ++e) {
-        device const half* k_row = (e < prefix)
-            ? ringK + uint64_t(e) * HD
-            : chunkKV + uint64_t(e - prefix) * HD;
+    const uint firstLogical = (total > WINDOW) ? (total - WINDOW) : 0u;
+    const uint prefixVisible = min(prefix, WINDOW);
+    const uint prefixOldest = prefix - prefixVisible;
+    for (uint e = 0; e < min(total, WINDOW); ++e) {
+        const uint logical = firstLogical + e;
+        device const half* k_row;
+        if (logical < prefix) {
+            const uint offset = logical - prefixOldest;
+            const uint slot = (ringStart + offset) & (WINDOW - 1u);
+            k_row = ringK + uint64_t(slot) * HD;
+        } else {
+            k_row = chunkKV + uint64_t(logical - prefix) * HD;
+        }
         float partial = 0.0f;
         for (uint i = lid; i < HD; i += lsize) {
             partial = fma(q_smem[i], float(k_row[i]), partial);

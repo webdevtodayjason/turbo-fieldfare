@@ -252,20 +252,35 @@ import TurboFieldfareValidationSupport
     private static let hd = 512
     private static let scale: Float = 1.0 / Float(512).squareRoot()
 
-    /// fp32 CPU reference: row i attends ring[0..<prefix] + chunk[0...i];
-    /// sink in the denominator only (not the max).
+    /// fp32 CPU reference: row i attends exactly the last 128 logical tokens
+    /// from the wrapped prefix ring + chunk[0...i]; sink in the denominator
+    /// only (not the max).
     static func refAttention(q: [Float], ring: [Float], chunk: [Float],
-                             sinks: [Float], rows: Int, prefix: Int) -> [Float] {
+                             sinks: [Float], rows: Int, prefix: Int,
+                             ringStart: Int = 0) -> [Float] {
         var out = [Float](repeating: 0, count: rows * heads * hd)
+        let window = 128
+        let prefixVisible = min(prefix, window)
+        let prefixOldest = prefix - prefixVisible
         for r in 0..<rows {
-            let total = prefix + r + 1
+            let logicalTotal = prefix + r + 1
+            let firstLogical = max(0, logicalTotal - window)
+            let total = min(logicalTotal, window)
             for h in 0..<heads {
                 let qBase = (r * heads + h) * hd
                 var scores = [Float](repeating: 0, count: total)
                 var m = -Float.infinity
                 for e in 0..<total {
-                    let kBase = (e < prefix) ? e * hd : (e - prefix) * hd
-                    let kSrc = (e < prefix) ? ring : chunk
+                    let logical = firstLogical + e
+                    var kSrc = ring
+                    var kBase = 0
+                    if logical < prefix {
+                        let slot = (ringStart + (logical - prefixOldest)) % window
+                        kBase = slot * hd
+                    } else {
+                        kSrc = chunk
+                        kBase = (logical - prefix) * hd
+                    }
                     var dot: Float = 0
                     for i in 0..<hd { dot += q[qBase + i] * kSrc[kBase + i] }
                     scores[e] = dot * scale
@@ -276,8 +291,16 @@ import TurboFieldfareValidationSupport
                 let oBase = (r * heads + h) * hd
                 for e in 0..<total {
                     let p = exp(scores[e] - m)
-                    let kBase = (e < prefix) ? e * hd : (e - prefix) * hd
-                    let kSrc = (e < prefix) ? ring : chunk
+                    let logical = firstLogical + e
+                    var kSrc = ring
+                    var kBase = 0
+                    if logical < prefix {
+                        let slot = (ringStart + (logical - prefixOldest)) % window
+                        kBase = slot * hd
+                    } else {
+                        kSrc = chunk
+                        kBase = (logical - prefix) * hd
+                    }
                     for i in 0..<hd { out[oBase + i] += p * kSrc[kBase + i] }
                 }
                 for i in 0..<hd { out[oBase + i] /= denom }
@@ -289,6 +312,7 @@ import TurboFieldfareValidationSupport
     private struct AttnFixture {
         var q, ring, chunk, sinks: [Float]
         let rows, prefix: Int
+        var ringStart: Int = 0
     }
 
     private func runAttention(_ fx: AttnFixture, proj: V4PrefillProj,
@@ -304,6 +328,7 @@ import TurboFieldfareValidationSupport
         proj.encodeWindowMQAPrefill(commandBuffer: cb,
                                     q: qBuf, windowK: ringBuf,
                                     prefixCount: fx.prefix,
+                                    ringStart: fx.ringStart,
                                     chunkKV: chunkBuf, rows: fx.rows,
                                     sinks: sinkBuf, out: outBuf)
         cb.commit(); cb.waitUntilCompleted()
@@ -319,6 +344,19 @@ import TurboFieldfareValidationSupport
         let sinks = (0..<Self.heads).map { _ in rng.uniform(-2, 2) }
         return AttnFixture(q: q, ring: ring, chunk: chunk, sinks: sinks,
                            rows: rows, prefix: prefix)
+    }
+
+    private func populateWrappedPrefixRing(prefixTokens: [Float], prefix: Int,
+                                           ringStart: Int) -> [Float] {
+        var ring = [Float](repeating: -123, count: Self.hd * 128)
+        let visible = min(prefix, 128)
+        let oldest = prefix - visible
+        for logical in oldest..<prefix {
+            let slot = (ringStart + (logical - oldest)) % 128
+            ring.replaceSubrange((slot * Self.hd)..<((slot + 1) * Self.hd),
+                                 with: prefixTokens[(logical * Self.hd)..<((logical + 1) * Self.hd)])
+        }
+        return ring
     }
 
     @Test func windowMQA_causalSet_matchesCPUReference() throws {
@@ -373,6 +411,76 @@ import TurboFieldfareValidationSupport
         // And the poisoned rows themselves must differ (the poison took effect).
         let tail = RelError.maxAbsDiff(Array(baseline[count...]), Array(after[count...]))
         #expect(tail > 1, "poisoned rows should diverge, maxAbsDiff=\(tail)")
+    }
+
+    @Test func windowMQA_prefixPlusRowOver128_usesExactLast128_chunk64() throws {
+        let ctx = try MetalContext()
+        let proj = try V4PrefillProj(device: ctx.device)
+        let rows = 64, prefix = 96
+        var fx = makeFixture(rows: rows, prefix: prefix, seed: 0xD05, label: "chunk64-over128")
+        fx.q = fx.q.map { Float(Float16($0)) }
+        fx.ring = fx.ring.map { Float(Float16($0)) }
+        fx.chunk = fx.chunk.map { Float(Float16($0)) }
+        let actual = try runAttention(fx, proj: proj, ctx: ctx)
+        let ref = Self.refAttention(q: fx.q, ring: fx.ring, chunk: fx.chunk,
+                                    sinks: fx.sinks, rows: fx.rows, prefix: fx.prefix,
+                                    ringStart: fx.ringStart)
+        let rel = RelError.compute(actual: actual, reference: ref)
+        #expect(rel < Tolerance.fp16ChainedReduction, "chunk64 last-128 rel=\(rel)")
+    }
+
+    @Test func windowMQA_wrappedRing_usesRingStart_chunk128() throws {
+        let ctx = try MetalContext()
+        let proj = try V4PrefillProj(device: ctx.device)
+        let rows = 128, prefix = 141, ringStart = 73
+        var fx = makeFixture(rows: rows, prefix: prefix, seed: 0xD06, label: "chunk128-wrap")
+        var rng = SeedTree(0xD06).key("prefix-tokens")
+        let prefixTokens = (0..<(prefix * Self.hd)).map { _ in Float(Float16(rng.uniform(-1, 1))) }
+        fx.q = fx.q.map { Float(Float16($0)) }
+        fx.chunk = fx.chunk.map { Float(Float16($0)) }
+        fx.ringStart = ringStart
+        fx.ring = populateWrappedPrefixRing(prefixTokens: prefixTokens, prefix: prefix,
+                                            ringStart: ringStart)
+
+        let actual = try runAttention(fx, proj: proj, ctx: ctx)
+        let ref = Self.refAttention(q: fx.q, ring: fx.ring, chunk: fx.chunk,
+                                    sinks: fx.sinks, rows: fx.rows, prefix: fx.prefix,
+                                    ringStart: fx.ringStart)
+        let rel = RelError.compute(actual: actual, reference: ref)
+        #expect(rel < Tolerance.fp16ChainedReduction, "wrapped chunk128 rel=\(rel)")
+
+        // Row 0 excludes logical prefix token 12 even though it is retained in
+        // the ring; poisoning that physical slot must not affect row 0.
+        let excludedLogical = prefix - 128
+        let excludedSlot = (ringStart + (excludedLogical - (prefix - 128))) % 128
+        var poisoned = fx
+        poisoned.ring.replaceSubrange((excludedSlot * Self.hd)..<((excludedSlot + 1) * Self.hd),
+                                      with: repeatElement(Float(250), count: Self.hd))
+        let after = try runAttention(poisoned, proj: proj, ctx: ctx)
+        let row0Count = Self.heads * Self.hd
+        let diff = RelError.maxAbsDiff(Array(actual[0..<row0Count]), Array(after[0..<row0Count]))
+        #expect(diff == 0, "row 0 changed after poisoning excluded oldest ring slot: \(diff)")
+    }
+
+    @Test func windowMQA_poisonFutureInvariant_chunk128() throws {
+        let ctx = try MetalContext()
+        let proj = try V4PrefillProj(device: ctx.device)
+        let rows = 128, leakFrom = 64
+        var fx = makeFixture(rows: rows, prefix: 17, seed: 0xD07, label: "chunk128-future")
+        fx.q = fx.q.map { Float(Float16($0)) }
+        fx.ring = fx.ring.map { Float(Float16($0)) }
+        fx.chunk = fx.chunk.map { Float(Float16($0)) }
+        let baseline = try runAttention(fx, proj: proj, ctx: ctx)
+
+        var poisoned = fx
+        for row in leakFrom..<rows {
+            for i in 0..<Self.hd { poisoned.chunk[row * Self.hd + i] = (row % 2 == 0) ? 300 : -300 }
+        }
+        let after = try runAttention(poisoned, proj: proj, ctx: ctx)
+
+        let count = leakFrom * Self.heads * Self.hd
+        let diff = RelError.maxAbsDiff(Array(baseline[0..<count]), Array(after[0..<count]))
+        #expect(diff == 0, "rows before poisoned future changed: maxAbsDiff=\(diff)")
     }
 
     @Test func windowMQA_hugeSink_drivesOutputToZero() throws {

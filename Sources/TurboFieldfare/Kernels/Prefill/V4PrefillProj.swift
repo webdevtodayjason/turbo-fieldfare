@@ -14,8 +14,8 @@ import Metal
 ///   `(startPosition + i) % window`, matching
 ///   `CompressedKVCacheManager.windowSlot` addressing.
 /// - `encodeWindowMQAPrefill`: batched causal window MQA, 64 heads x 512,
-///   per-head sinks in the denominator only; row i attends
-///   `ring[0..<prefixCount] + chunkKV[0...i]`.
+///   per-head sinks in the denominator only; row i attends exactly the
+///   last 128 logical tokens from prefix + `chunkKV[0...i]`.
 /// - `encodeGroupedOProjDown` / `encodeOProjUp`: the 8-group o-projection
 ///   (group slices, NOT one flat GEMM — design-note pitfall 676731b).
 ///
@@ -203,15 +203,16 @@ final class V4PrefillProj {
 
     // MARK: - 3. Batched causal window MQA prefill attention
 
-    /// Causal window MQA over one chunk: row i attends exactly
-    /// `ring[0..<prefixCount]` (tokens flushed by earlier chunks, at ring
-    /// slots 0..prefixCount-1) followed by `chunkKV[0...i]` (previous chunk
-    /// rows plus itself). Per-head sinks enter the denominator only, matching
-    /// `v4_sink_combine`. FP16 in/out.
+    /// Causal window MQA over one chunk: row i attends exactly the last 128
+    /// logical tokens among `prefixCount` flushed tokens and `chunkKV[0...i]`.
+    /// The flushed prefix lives in a wrapped 128-slot ring; `ringStart` is the
+    /// physical slot containing the oldest retained prefix token. Per-head
+    /// sinks enter the denominator only, matching `v4_sink_combine`. FP16 in/out.
     ///
     /// - `q`: [rows, 64, 512] fp16 (post per-head norms + RoPE).
-    /// - `windowK`: [window, 512] fp16 ring; the first `prefixCount` slots
-    ///   are the visible prefix.
+    /// - `windowK`: [window, 512] fp16 wrapped ring containing the last
+    ///   `min(prefixCount, window)` flushed prefix tokens.
+    /// - `ringStart`: physical slot of the oldest retained prefix token.
     /// - `chunkKV`: [rows, 512] fp16 staged chunk KV (shared K == V).
     /// - `sinks`: [64] fp32 per-head sink logits.
     /// - `out`: [rows, 64, 512] fp16.
@@ -219,12 +220,14 @@ final class V4PrefillProj {
                                 q: MTLBuffer, qOffset: Int = 0,
                                 windowK: MTLBuffer, windowKOffset: Int = 0,
                                 prefixCount: Int,
+                                ringStart: Int = 0,
                                 chunkKV: MTLBuffer, chunkKVOffset: Int = 0,
                                 rows: Int,
                                 sinks: MTLBuffer, sinksOffset: Int = 0,
                                 out: MTLBuffer, outOffset: Int = 0) {
         precondition(rows > 0)
-        precondition(prefixCount >= 0 && prefixCount <= Self.window)
+        precondition(prefixCount >= 0)
+        precondition(ringStart >= 0 && ringStart < Self.window)
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(attnPSO)
         enc.setBuffer(q, offset: qOffset, index: 0)
@@ -233,9 +236,11 @@ final class V4PrefillProj {
         enc.setBuffer(sinks, offset: sinksOffset, index: 3)
         enc.setBuffer(out, offset: outOffset, index: 4)
         var p = UInt32(prefixCount)
+        var rs = UInt32(ringStart)
         var sc = Self.softmaxScale
         enc.setBytes(&p, length: 4, index: 5)
-        enc.setBytes(&sc, length: 4, index: 6)
+        enc.setBytes(&rs, length: 4, index: 6)
+        enc.setBytes(&sc, length: 4, index: 7)
         let tg = min(Self.threadsPerGroup, Int(attnPSO.maxTotalThreadsPerThreadgroup))
         enc.dispatchThreadgroups(
             MTLSize(width: rows * Self.numQHeads, height: 1, depth: 1),
